@@ -123,8 +123,8 @@ static bool cui__vk_buffer_make(cui_gpu_renderer *r, cui__vk_buffer *b, size_t c
         vkDestroyBuffer(dev, made.buffer, NULL);
         return false;
     }
-    vkBindBufferMemory(dev, made.buffer, made.memory, 0);
-    if (vkMapMemory(dev, made.memory, 0, VK_WHOLE_SIZE, 0, (void **)&made.ptr) != VK_SUCCESS) {
+    if (vkBindBufferMemory(dev, made.buffer, made.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(dev, made.memory, 0, VK_WHOLE_SIZE, 0, (void **)&made.ptr) != VK_SUCCESS) {
         vkDestroyBuffer(dev, made.buffer, NULL);
         vkFreeMemory(dev, made.memory, NULL);
         return false;
@@ -149,7 +149,10 @@ static void cui__vk_wait(cui_gpu_renderer *r, uint64_t value) {
     info.semaphoreCount = 1;
     info.pSemaphores = &r->timeline;
     info.pValues = &value;
-    vkWaitSemaphores(r->device, &info, UINT64_MAX);
+    if (vkWaitSemaphores(r->device, &info, UINT64_MAX) != VK_SUCCESS) {   /* (the device is gone: nothing more is drawn) */
+        r->lost = true;
+        vkDeviceWaitIdle(r->device);
+    }
 }
 
 static void cui__vk_later_free(cui_gpu_renderer *r, const cui__vk_later *l) {
@@ -165,7 +168,7 @@ static void cui__vk_later_free(cui_gpu_renderer *r, const cui__vk_later *l) {
 /* the objects whose submission is done (all of them when idle); their texture slots are free again */
 static void cui__vk_collect(cui_gpu_renderer *r, bool all) {
     uint64_t done = UINT64_MAX;
-    if (!all) vkGetSemaphoreCounterValue(r->device, r->timeline, &done);
+    if (!all && vkGetSemaphoreCounterValue(r->device, r->timeline, &done) != VK_SUCCESS) return;   /* not known: nothing is freed yet */
     int n = 0;
     for (int i = 0; i < r->later_count; i++) {
         if (r->later[i].value <= done) cui__vk_later_free(r, &r->later[i]);
@@ -192,10 +195,10 @@ static VkCommandBuffer cui__vk_cmd(cui_gpu_renderer *r) {
     if (!r->open) {
         int f = r->frame;
         cui__vk_wait(r, r->cmd_value[f]);
-        vkResetCommandBuffer(r->cmd[f], 0);
         VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(r->cmd[f], &begin);
+        /* a buffer that could not be begun records nothing; cui__vk_submit then leaves it out */
+        if (vkResetCommandBuffer(r->cmd[f], 0) != VK_SUCCESS || vkBeginCommandBuffer(r->cmd[f], &begin) != VK_SUCCESS) r->lost = true;
         r->upload[f].used = 0;
         r->open = true;
     }
@@ -207,7 +210,11 @@ static VkCommandBuffer cui__vk_cmd(cui_gpu_renderer *r) {
 static void cui__vk_submit(cui_gpu_renderer *r, VkSemaphore wait, VkSemaphore signal) {
     if (!r->open) return;
     int f = r->frame;
-    vkEndCommandBuffer(r->cmd[f]);
+    if (vkEndCommandBuffer(r->cmd[f]) != VK_SUCCESS) r->lost = true;
+    if (r->lost) {   /* nothing of it runs, and nothing waits for it */
+        r->open = false;
+        return;
+    }
     uint64_t value = ++r->value;
     VkSemaphore signals[2] = { r->timeline, signal };
     uint64_t values[2] = { value, 0 };
@@ -298,12 +305,12 @@ static uint8_t *cui__vk_upload(cui_gpu_renderer *r, size_t bytes, size_t align, 
 
 /* ---- textures: R8 for the glyph atlas, RGBA8 for images ---- */
 
-static void cui__vk_tex_upload(cui_gpu_renderer *r, cui__vk_tex *t, int x, int y, int w, int h, const void *pixels, int stride, bool fresh) {
+static bool cui__vk_tex_upload(cui_gpu_renderer *r, cui__vk_tex *t, int x, int y, int w, int h, const void *pixels, int stride, bool fresh) {
     size_t row = (size_t)w * (size_t)t->bpp, from = stride ? (size_t)stride : row;
     VkBuffer src;
     size_t offset;
     uint8_t *p = cui__vk_upload(r, row * (size_t)h, 16, &src, &offset);
-    if (!p) return;
+    if (!p) return false;   /* no memory for the pixels */
     for (int k = 0; k < h; k++) memcpy(p + (size_t)k * row, (const uint8_t *)pixels + (size_t)k * from, row);
     cui__vk_barrier(r, t->image, fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy copy = { 0 };
@@ -314,11 +321,12 @@ static void cui__vk_tex_upload(cui_gpu_renderer *r, cui__vk_tex *t, int x, int y
     copy.imageExtent.width = (uint32_t)w; copy.imageExtent.height = (uint32_t)h; copy.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(cui__vk_cmd(r), src, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     cui__vk_barrier(r, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return true;
 }
 
 static cui_texture cui__vk_tex_create(void *user, int w, int h, cui_texture_format fmt, const void *pixels) {
     cui_gpu_renderer *r = user;
-    if (w <= 0 || h <= 0) return 0;
+    if (w <= 0 || h <= 0 || r->lost) return 0;
     cui__vk_collect(r, false);   /* (slots whose textures are done with) */
     int slot = -1;
     for (int i = 0; i < r->tex_count; i++) if (!r->tex[i].bpp && !r->tex[i].image) { slot = i; break; }
@@ -382,15 +390,22 @@ static cui_texture cui__vk_tex_create(void *user, int w, int h, cui_texture_form
     vkUpdateDescriptorSets(dev, 1, &write, 0, NULL);
     made.bpp = fmt == CUI_TEXTURE_R8 ? 1 : 4;
     r->tex[slot] = made;
-    if (pixels) cui__vk_tex_upload(r, &r->tex[slot], 0, 0, w, h, pixels, 0, true);
-    else cui__vk_barrier(r, made.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (pixels && !cui__vk_tex_upload(r, &r->tex[slot], 0, 0, w, h, pixels, 0, true)) {
+        /* no texture without its pixels: the caller is told, and can make it again (no command uses it yet) */
+        cui__vk_later gone = { 0 };
+        gone.image = made.image; gone.view = made.view; gone.memory = made.memory; gone.set = made.set; gone.slot = slot;
+        memset(&r->tex[slot], 0, sizeof r->tex[slot]);
+        cui__vk_later_free(r, &gone);
+        return 0;
+    }
+    if (!pixels) cui__vk_barrier(r, made.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return (cui_texture)(slot + 1);
 }
 
 static void cui__vk_tex_update(void *user, cui_texture tex, int x, int y, int w, int h, const void *pixels, int stride) {
     cui_gpu_renderer *r = user;
     int slot = (int)tex - 1;
-    if (slot < 0 || slot >= r->tex_count || !r->tex[slot].image || w <= 0 || h <= 0 || !pixels) return;
+    if (slot < 0 || slot >= r->tex_count || !r->tex[slot].image || w <= 0 || h <= 0 || !pixels || r->lost) return;
     cui__vk_tex_upload(r, &r->tex[slot], x, y, w, h, pixels, stride, false);
 }
 
@@ -631,7 +646,8 @@ static bool cui__vk_device(cui_gpu_renderer *r) {
     /* a UNORM format (blending in sRGB): BGRA, else RGBA */
     VkSurfaceFormatKHR fmts[64];
     uint32_t n = 64;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical, r->surface, &n, fmts);
+    VkResult listed = vkGetPhysicalDeviceSurfaceFormatsKHR(r->physical, r->surface, &n, fmts);
+    if (listed != VK_SUCCESS && listed != VK_INCOMPLETE) n = 0;
     for (uint32_t i = 0; i < n && !r->format; i++) if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) r->format = fmts[i].format;
     for (uint32_t i = 0; i < n && !r->format; i++) if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) r->format = fmts[i].format;
     if (!r->format || !cui__vk_pipeline(r)) return false;
@@ -647,8 +663,11 @@ static bool cui__vk_device(cui_gpu_renderer *r) {
 
 /* ---- the window ---- */
 
+/* The swapchain's views and its presentation semaphores: a semaphore a failed presentation left
+ * signalled must not meet the next swapchain's images. The caller has made the device idle. */
 static void cui__vk_views_free(cui_gpu_renderer *r) {
     for (uint32_t i = 0; i < r->image_count; i++) { vkDestroyImageView(r->device, r->views[i], NULL); r->views[i] = VK_NULL_HANDLE; }
+    for (int i = 0; i < CUI__TV_MAX_IMAGES; i++) if (r->present_sem[i]) { vkDestroySemaphore(r->device, r->present_sem[i], NULL); r->present_sem[i] = VK_NULL_HANDLE; }
     r->image_count = 0;
 }
 
@@ -700,7 +719,15 @@ static bool cui__vk_swapchain(cui_gpu_renderer *r) {
     info.clipped = VK_TRUE;
     info.oldSwapchain = r->swapchain;
     VkSwapchainKHR sc = VK_NULL_HANDLE;
-    if (vkCreateSwapchainKHR(dev, &info, NULL, &sc) != VK_SUCCESS) return false;
+    if (vkCreateSwapchainKHR(dev, &info, NULL, &sc) != VK_SUCCESS) {
+        /* the old one is retired even so, and may not be handed in again: the next try starts from none */
+        cui__vk_views_free(r);
+        if (r->swapchain) vkDestroySwapchainKHR(dev, r->swapchain, NULL);
+        r->swapchain = VK_NULL_HANDLE;
+        r->extent.width = r->extent.height = 0;
+        r->stale = true;
+        return false;
+    }
     cui__vk_views_free(r);
     if (r->swapchain) vkDestroySwapchainKHR(dev, r->swapchain, NULL);
     r->swapchain = sc;
@@ -768,7 +795,10 @@ cui_gpu_renderer *cui_gpu_create(void *window, bool vsync) {
     if (!cui__vk_instance(r)) { cui_gpu_destroy(r); return NULL; }
     if (cui__vk_surface(r) != VK_SUCCESS) { r->surface = VK_NULL_HANDLE; cui_gpu_destroy(r); return NULL; }
     if (!cui__vk_device(r)) { cui_gpu_destroy(r); return NULL; }
-    r->stale = true;   /* the swapchain comes with the first frame */
+    /* The swapchain now, while the app can still draw with OpenGL instead. (A window without a
+     * size yet has none to make: it comes with the first frame.) */
+    r->stale = true;
+    if (r->xwin->width > 0 && r->xwin->height > 0 && !cui__vk_swapchain(r)) { cui_gpu_destroy(r); return NULL; }
     return r;
 }
 
@@ -825,7 +855,7 @@ static bool cui__vk_acquire(cui_gpu_renderer *r, cui__vk_frame *f) {
 }
 
 /* Into the swapchain image: clear, then a draw per command (cui_gl_render's counterpart). */
-static void cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_draw_data *dd) {
+static bool cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_draw_data *dd) {
     VkCommandBuffer cmd = f->cmd;
     /* the frame's vertices and indices */
     size_t vbytes = sizeof(cui_vertex) * (size_t)dd->vertex_count, ibytes = sizeof(uint32_t) * (size_t)dd->index_count;
@@ -833,6 +863,7 @@ static void cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
     size_t vat = 0, iat = 0;
     uint8_t *v = dd->index_count ? cui__vk_upload(r, vbytes, 16, &vbuf, &vat) : NULL;
     uint8_t *ix = v ? cui__vk_upload(r, ibytes, 16, &ibuf, &iat) : NULL;   /* (a buffer outgrown between the two lives until this frame has run) */
+    bool drawn = !dd->index_count || (v && ix);
 
     cui__vk_barrier(r, f->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo color = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
@@ -886,6 +917,7 @@ static void cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
         }
     }
     vkCmdEndRendering(cmd);
+    return drawn;   /* false: the vertices found no room, and only the cleared window is shown */
 }
 
 /* The frame copied out, if asked, and the image made ready to present. */
@@ -908,6 +940,7 @@ static void cui__vk_copy_out(cui_gpu_renderer *r, cui__vk_frame *f, bool wanted)
 static void cui__vk_present(cui_gpu_renderer *r, const cui__vk_frame *f) {
     VkSemaphore present = r->present_sem[r->image];
     cui__vk_submit(r, f->acquire, present);
+    if (r->lost) return;   /* (nothing was submitted: there is nothing to present) */
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &present;
@@ -923,7 +956,7 @@ static bool cui__vk_read_back(cui_gpu_renderer *r, cui__vk_frame *f, const cui_d
     if (f->readback.buffer) {
         cui__vk_wait(r, r->value);
         int w = (int)r->extent.width, h = (int)r->extent.height;
-        if (w == dd->width_px && h == dd->height_px) {
+        if (!r->lost && w == dd->width_px && h == dd->height_px) {
             const uint8_t *src = f->readback.ptr;
             uint8_t *dst = rgba;
             bool bgra = r->format == VK_FORMAT_B8G8R8A8_UNORM;
@@ -941,10 +974,10 @@ static bool cui__vk_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *r
     if (!r || !dd || r->lost) return false;
     cui__vk_frame f = { 0 };
     if (!cui__vk_acquire(r, &f)) return false;
-    cui__vk_draw(r, &f, dd);
+    bool drawn = cui__vk_draw(r, &f, dd);
     cui__vk_copy_out(r, &f, rgba != NULL);
     cui__vk_present(r, &f);
-    return cui__vk_read_back(r, &f, dd, rgba);
+    return cui__vk_read_back(r, &f, dd, rgba) && drawn;   /* (a capture of a frame that was not drawn is none) */
 }
 
 void cui_gpu_render(cui_gpu_renderer *r, const cui_draw_data *dd) { cui__vk_render(r, dd, NULL); }

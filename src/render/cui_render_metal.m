@@ -110,6 +110,7 @@ static const char cui__mtl_msl[] =
  * (destroyed, never made) draws the black texel instead of being used as an object. */
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id<MTLTexture>> *textures;
 @property (nonatomic, assign) int slot;
+@property (nonatomic, strong) id<MTLCommandBuffer> last;   /* the frame committed last */
 @end
 @implementation CUIMetalWindow
 @end
@@ -152,6 +153,9 @@ static void cui__mtl_tex_update(void *user, cui_texture tex, int x, int y, int w
     @autoreleasepool {
         id<MTLTexture> t = cui__mtl_win(user).textures[@((uintptr_t)tex)];
         if (!t) return;
+        /* replaceRegion writes at once, and is not ordered after frames on the GPU: a frame still
+         * drawing may sample this texture, so the copy waits for the last one (no wait if it is done) */
+        [cui__mtl_win(user).last waitUntilCompleted];
         NSUInteger bpp = t.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4;
         [t replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h) mipmapLevel:0
                withBytes:pixels bytesPerRow:stride ? (NSUInteger)stride : (NSUInteger)w * bpp];
@@ -405,6 +409,7 @@ static bool cui__mtl_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *
         cui__mtl_layer(r, w, fw, fh, rgba != NULL);
         CUIMetalSlot *slot = cui__mtl_slot(w);
         bool any = cui__mtl_upload(w, slot, dd);
+        bool drawn = any || dd->index_count <= 0 || dd->vertex_count <= 0;   /* false: the vertices found no room */
 
         id<CAMetalDrawable> drawable = [w.layer nextDrawable];   /* waits for one to be free: the pacing */
         if (!drawable) return false;
@@ -419,8 +424,11 @@ static bool cui__mtl_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *
         [cmd presentDrawable:drawable];
         [cmd commit];
         slot.reader = cmd;
+        w.last = cmd;
         if (!readback) return !rgba;
         [cmd waitUntilCompleted];
+        /* (a capture of a frame that was not drawn, or that the GPU did not finish, is none) */
+        if (!drawn || cmd.status != MTLCommandBufferStatusCompleted) return false;
         cui__mtl_read_back(readback, fw, fh, rgba);
         return true;
     }

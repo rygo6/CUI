@@ -142,10 +142,19 @@ struct cui_gpu_renderer {
 
 /* ---- submissions ---- */
 
+/* The device is gone (a driver update, a GPU reset, the adapter taken away) or a call it cannot
+ * go on without failed. Nothing recreates it: the window keeps its last picture, and the calls
+ * that would use the device are not made. */
+static void cui__d3d12_lose(cui_gpu_renderer *r) {
+    if (!r->lost) fprintf(stderr, "cui: Direct3D 12 stopped (the device was lost, or it ran out of memory); the window is not drawn any more\n");
+    r->lost = true;
+}
+
 static void cui__d3d12_wait(cui_gpu_renderer *r, uint64_t value) {
     if (value == 0 || r->fence->lpVtbl->GetCompletedValue(r->fence) >= value) return;
-    r->fence->lpVtbl->SetEventOnCompletion(r->fence, value, r->event);
-    WaitForSingleObject(r->event, INFINITE);
+    if (SUCCEEDED(r->fence->lpVtbl->SetEventOnCompletion(r->fence, value, r->event)) && WaitForSingleObject(r->event, INFINITE) == WAIT_OBJECT_0) return;
+    /* the event was not set up: look at the fence itself (a removed device completes every value) */
+    while (r->fence->lpVtbl->GetCompletedValue(r->fence) < value) Sleep(1);
 }
 
 /* the objects whose fence has passed (all of them when idle); their texture slots are free again */
@@ -182,8 +191,8 @@ static ID3D12GraphicsCommandList *cui__d3d12_cmd(cui_gpu_renderer *r) {
     if (!r->open) {
         int f = r->frame;
         cui__d3d12_wait(r, r->alloc_fence[f]);
-        r->alloc[f]->lpVtbl->Reset(r->alloc[f]);
-        r->list->lpVtbl->Reset(r->list, r->alloc[f], NULL);
+        /* a list that could not be opened records nothing; cui__d3d12_submit then leaves it out */
+        if (FAILED(r->alloc[f]->lpVtbl->Reset(r->alloc[f])) || FAILED(r->list->lpVtbl->Reset(r->list, r->alloc[f], NULL))) cui__d3d12_lose(r);
         r->upload[f].used = 0;
         r->open = true;
     }
@@ -193,7 +202,11 @@ static ID3D12GraphicsCommandList *cui__d3d12_cmd(cui_gpu_renderer *r) {
 static void cui__d3d12_submit(cui_gpu_renderer *r) {
     if (!r->open) return;
     ID3D12GraphicsCommandList *list = r->list;
-    list->lpVtbl->Close(list);
+    if (r->lost || FAILED(list->lpVtbl->Close(list))) {   /* nothing of it runs, and nothing waits for it */
+        cui__d3d12_lose(r);
+        r->open = false;
+        return;
+    }
     r->queue->lpVtbl->ExecuteCommandLists(r->queue, 1, (ID3D12CommandList **)&list);
     r->queue->lpVtbl->Signal(r->queue, r->fence, ++r->fence_value);
     r->alloc_fence[r->frame] = r->fence_value;
@@ -273,15 +286,12 @@ static D3D12_CPU_DESCRIPTOR_HANDLE cui__d3d12_rtv_at(cui_gpu_renderer *r, int i)
 
 /* ---- textures: R8 for the glyph atlas, RGBA8 for images ---- */
 
-static void cui__d3d12_tex_upload(cui_gpu_renderer *r, cui__d3d12_tex *t, int x, int y, int w, int h, const void *pixels, int stride, bool fresh) {
+static bool cui__d3d12_tex_upload(cui_gpu_renderer *r, cui__d3d12_tex *t, int x, int y, int w, int h, const void *pixels, int stride, bool fresh) {
     UINT pitch = (UINT)((w * t->bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1));
     ID3D12Resource *src = NULL;
     size_t offset = 0;
     uint8_t *p = cui__d3d12_upload(r, (size_t)pitch * (size_t)h, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, NULL, &src, &offset);
-    if (!p) {   /* no memory for the pixels: a new texture is still left in the state draws expect */
-        if (fresh) cui__d3d12_barrier(r, t->res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        return;
-    }
+    if (!p) return false;   /* no memory for the pixels */
     size_t row = (size_t)w * (size_t)t->bpp, from = stride ? (size_t)stride : row;
     for (int k = 0; k < h; k++) memcpy(p + (size_t)k * pitch, (const uint8_t *)pixels + (size_t)k * from, row);
     if (!fresh) cui__d3d12_barrier(r, t->res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -298,11 +308,12 @@ static void cui__d3d12_tex_upload(cui_gpu_renderer *r, cui__d3d12_tex *t, int x,
     from_loc.PlacedFootprint.Footprint.RowPitch = pitch;
     r->list->lpVtbl->CopyTextureRegion(r->list, &dst, (UINT)x, (UINT)y, 0, &from_loc, NULL);
     cui__d3d12_barrier(r, t->res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return true;
 }
 
 static cui_texture cui__d3d12_tex_create(void *user, int w, int h, cui_texture_format fmt, const void *pixels) {
     cui_gpu_renderer *r = user;
-    if (w <= 0 || h <= 0) return 0;
+    if (w <= 0 || h <= 0 || r->lost) return 0;
     cui__d3d12_flush_backlog(r);
     int slot = -1;
     for (int i = 0; i < r->tex_count; i++) if (!r->tex[i].bpp) { slot = i; break; }
@@ -332,15 +343,20 @@ static cui_texture cui__d3d12_tex_create(void *user, int w, int h, cui_texture_f
     t->bpp = fmt == CUI_TEXTURE_R8 ? 1 : 4;
     D3D12_CPU_DESCRIPTOR_HANDLE at = { r->srv_cpu.ptr + (SIZE_T)slot * r->srv_inc };
     r->device->lpVtbl->CreateShaderResourceView(r->device, t->res, NULL, at);
-    if (pixels) cui__d3d12_tex_upload(r, t, 0, 0, w, h, pixels, 0, true);
-    else cui__d3d12_barrier(r, t->res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (pixels && !cui__d3d12_tex_upload(r, t, 0, 0, w, h, pixels, 0, true)) {
+        /* no texture without its pixels: the caller is told, and can make it again (no command uses it yet) */
+        CUI__REL(t->res);
+        t->bpp = 0;
+        return 0;
+    }
+    if (!pixels) cui__d3d12_barrier(r, t->res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return (cui_texture)(slot + 1);
 }
 
 static void cui__d3d12_tex_update(void *user, cui_texture tex, int x, int y, int w, int h, const void *pixels, int stride) {
     cui_gpu_renderer *r = user;
     int slot = (int)tex - 1;
-    if (slot < 0 || slot >= r->tex_count || !r->tex[slot].res || w <= 0 || h <= 0 || !pixels) return;
+    if (slot < 0 || slot >= r->tex_count || !r->tex[slot].res || w <= 0 || h <= 0 || !pixels || r->lost) return;
     cui__d3d12_flush_backlog(r);
     cui__d3d12_tex_upload(r, &r->tex[slot], x, y, w, h, pixels, stride, false);
 }
@@ -510,12 +526,7 @@ static bool cui__d3d12_targets(cui_gpu_renderer *r) {
     return true;
 }
 
-/* The device is gone (a driver update, a GPU reset, the adapter taken away). Nothing recreates it:
- * the window keeps its last picture, and the calls that would use the device are not made. */
-static void cui__d3d12_lose(cui_gpu_renderer *r) {
-    if (!r->lost) fprintf(stderr, "cui: the Direct3D 12 device was lost; the window is not drawn any more\n");
-    r->lost = true;
-}
+
 
 static bool cui__d3d12_swapchain(cui_gpu_renderer *r) {
     DXGI_SWAP_CHAIN_DESC1 desc = { 0 };
@@ -620,13 +631,15 @@ static bool cui__d3d12_acquire(cui_gpu_renderer *r, cui__d3d12_frame *f, const c
 }
 
 /* The frame's vertices and indices, then a draw per command (cui_gl_render's counterpart). */
-static void cui__d3d12_draw(cui_gpu_renderer *r, const cui__d3d12_frame *f, const cui_draw_data *dd) {
+/* False when the frame's vertices found no room: only the cleared window is shown. */
+static bool cui__d3d12_draw(cui_gpu_renderer *r, const cui__d3d12_frame *f, const cui_draw_data *dd) {
     ID3D12GraphicsCommandList *cmd = f->cmd;
     size_t vbytes = sizeof(cui_vertex) * (size_t)dd->vertex_count, ibytes = sizeof(uint32_t) * (size_t)dd->index_count;
     D3D12_GPU_VIRTUAL_ADDRESS vva = 0, iva = 0;
     uint8_t *v = dd->index_count ? cui__d3d12_upload(r, vbytes, 16, &vva, NULL, NULL) : NULL;
     uint8_t *ix = v ? cui__d3d12_upload(r, ibytes, 16, &iva, NULL, NULL) : NULL;
-    if (!v || !ix) return;
+    if (!dd->index_count) return true;
+    if (!v || !ix) return false;
     memcpy(v, dd->vertices, vbytes);
     memcpy(ix, dd->indices, ibytes);
     int W = dd->width_px, H = dd->height_px;
@@ -665,6 +678,7 @@ static void cui__d3d12_draw(cui_gpu_renderer *r, const cui__d3d12_frame *f, cons
         }
         cmd->lpVtbl->DrawIndexedInstanced(cmd, c->index_count, 1, c->index_offset, 0, 0);
     }
+    return true;
 }
 
 /* The frame copied out, if asked, and the back buffer made ready to present. */
@@ -722,10 +736,10 @@ static bool cui__d3d12_render(cui_gpu_renderer *r, const cui_draw_data *dd, void
     if (!r || !dd || r->lost) return false;
     cui__d3d12_frame f = { 0 };
     if (!cui__d3d12_acquire(r, &f, dd)) return false;
-    cui__d3d12_draw(r, &f, dd);
+    bool drawn = cui__d3d12_draw(r, &f, dd);
     cui__d3d12_copy_out(r, &f, rgba != NULL);
     cui__d3d12_present(r);
-    bool ok = cui__d3d12_read_back(r, &f, dd, rgba);
+    bool ok = cui__d3d12_read_back(r, &f, dd, rgba) && drawn && !r->lost;   /* (a capture of a frame that was not drawn, or not finished, is none) */
     /* wait until the swapchain can take another frame */
     WaitForSingleObjectEx(r->waitable, 1000, TRUE);
     return ok;

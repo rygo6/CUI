@@ -94,9 +94,10 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
     /* the platform's GPU renderer (Direct3D 12, Vulkan or Metal), when asked for:
      * CUI_RENDERER_GPU, or CUI_RENDERER=gpu or its name (d3d12, vulkan, metal) */
     if (d->renderer == CUI_RENDERER_GPU || cui__env_is("CUI_RENDERER", "gpu") || cui__env_is("CUI_RENDERER", CUI__APP_GPU_NAME)) {
-        void *gpu_window = cui__plat_native(app);
 #if defined(__linux__)
-        gpu_window = cui__plat_x11_window ? cui__plat_x11_window(app) : NULL;   /* only the X11 backend lends its window */
+        void *gpu_window = cui__plat_x11_window ? cui__plat_x11_window(app) : NULL;   /* only the X11 backend lends its window */
+#else
+        void *gpu_window = cui__plat_native(app);
 #endif
         const char *plat = cui__plat_name();
         if (gpu_window && (!strcmp(plat, "win32") || !strcmp(plat, "cocoa") || !strcmp(plat, "x11")))
