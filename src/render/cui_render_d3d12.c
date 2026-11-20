@@ -568,15 +568,17 @@ static bool cui__d3d12_swapchain(cui_gpu_renderer *r) {
 
 void cui_gpu_destroy(cui_gpu_renderer *r) {
     if (!r) return;
-    /* Stopped on a device that is still there: work may be running that no fence value accounts
-     * for. What it uses is left alone; only the memory on this side is given back. */
+    if (r->queue && r->fence) cui__d3d12_idle(r);
+    /* Stopped on a device that is still there (before or during that idle): work may be running
+     * that no fence value accounts for. What it uses is left alone; only the memory on this side
+     * is given back. */
     if (r->lost && r->device && SUCCEEDED(r->device->lpVtbl->GetDeviceRemovedReason(r->device))) {
         free(r->later);
         free(r->tex);
         free(r);
         return;
     }
-    if (r->queue && r->fence) { cui__d3d12_idle(r); cui__d3d12_collect(r, true); }
+    if (r->queue && r->fence) cui__d3d12_collect(r, true);
     free(r->later);
     for (int i = 0; i < CUI__T12_BUFFERS; i++) CUI__REL(r->buffers[i]);
     if (r->waitable) CloseHandle(r->waitable);
@@ -743,6 +745,10 @@ static void cui__d3d12_present(cui_gpu_renderer *r) {
 /* Waits for the copy and writes it as RGBA; false if one was asked for and could not be made. */
 static bool cui__d3d12_read_back(cui_gpu_renderer *r, cui__d3d12_frame *f, const cui_draw_data *dd, void *rgba) {
     bool ok = !rgba;
+    if (f->readback.res && r->lost) {   /* the copy may still be writing it: it is neither read nor released */
+        f->readback.res = NULL;
+        return false;
+    }
     if (f->readback.res) {
         cui__d3d12_wait(r, r->fence_value);
         if ((int)f->fp.Footprint.Width == dd->width_px && (int)f->fp.Footprint.Height == dd->height_px) {

@@ -783,7 +783,14 @@ void cui_gpu_destroy(cui_gpu_renderer *r) {
     VkDevice dev = r->device;
     if (dev) {
         if (r->timeline) cui__vk_idle(r);
-        vkDeviceWaitIdle(dev);   /* (presents too: their semaphores go below) */
+        if (!cui__vk_idle_or_gone(r)) {   /* (presents too: their semaphores go below) */
+            /* Not known to be done with anything: what the device may still use is left alone,
+             * and only the memory on this side is given back. */
+            free(r->later);
+            free(r->tex);
+            free(r);
+            return;
+        }
         cui__vk_views_free(r);
         if (r->swapchain) vkDestroySwapchainKHR(dev, r->swapchain, NULL);
         for (int i = 0; i < CUI__TV_MAX_IMAGES; i++) if (r->present_sem[i]) vkDestroySemaphore(dev, r->present_sem[i], NULL);
@@ -859,7 +866,10 @@ static bool cui__vk_acquire(cui_gpu_renderer *r, cui__vk_frame *f) {
     for (int attempt = 0; attempt < 2 && !acquired; attempt++) {
         if (cui__vk_resized(r)) {
             cui__vk_idle(r);
-            vkDeviceWaitIdle(dev);
+            if (r->lost || vkDeviceWaitIdle(dev) != VK_SUCCESS) {   /* (not known to be done with the old images: they stay) */
+                r->lost = true;
+                return false;
+            }
             if (!cui__vk_swapchain(r)) break;
             f->cmd = cui__vk_cmd(r);
             if (!f->cmd) return false;
@@ -985,7 +995,10 @@ static void cui__vk_present(cui_gpu_renderer *r, const cui__vk_frame *f) {
 static bool cui__vk_read_back(cui_gpu_renderer *r, cui__vk_frame *f, const cui_draw_data *dd, void *rgba) {
     bool ok = !rgba;
     if (f->readback.buffer) {
-        if (!cui__vk_wait(r, r->value)) {   /* the copy may still be writing it: it is left alone */
+        if (!cui__vk_wait(r, r->value)) {   /* the copy may still be writing it: it goes when the renderer does */
+            cui__vk_later l = { 0 };
+            l.buffer = f->readback.buffer; l.memory = f->readback.memory; l.slot = -1;
+            cui__vk_release_later(r, l);
             memset(&f->readback, 0, sizeof f->readback);
             return false;
         }
