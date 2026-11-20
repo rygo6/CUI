@@ -106,6 +106,7 @@ typedef struct cui__d3d12_tex { ID3D12Resource *res; int bpp; DXGI_FORMAT fmt; }
 typedef struct cui__d3d12_later { IUnknown *obj; uint64_t fence; int slot; } cui__d3d12_later;
 
 struct cui_gpu_renderer {
+    cui_expanded expanded;          /* instances written out as vertices: this renderer draws vertices only */
     HWND hwnd;
     bool vsync, tearing;
     IDXGIFactory4 *factory;
@@ -577,6 +578,7 @@ void cui_gpu_destroy(cui_gpu_renderer *r) {
         return;
     }
     if (r->queue && r->fence) { cui__d3d12_idle(r); cui__d3d12_collect(r, true); }
+    cui_expanded_free(&r->expanded);
     free(r->later);
     for (int i = 0; i < CUI__T12_BUFFERS; i++) CUI__REL(r->buffers[i]);
     if (r->waitable) CloseHandle(r->waitable);
@@ -761,6 +763,8 @@ static bool cui__d3d12_read_back(cui_gpu_renderer *r, cui__d3d12_frame *f, const
 
 static bool cui__d3d12_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *rgba) {
     if (!r || !dd || r->lost) return false;
+    dd = cui_expand_instances(&r->expanded, dd);
+    if (!dd) return false;
     cui__d3d12_frame f = { 0 };
     if (!cui__d3d12_acquire(r, &f, dd)) return false;
     bool drawn = cui__d3d12_draw(r, &f, dd);

@@ -50,6 +50,28 @@ All fields except `x, y, u, v, lx, ly, color` are the same for every vertex of a
 
 Dither vertices carry the cell grid in `u, v` (in cells, interpolated), the density in `color.a` (interpolated) and a floor in `border`. Each cell is either the dot color or nothing, so the dither components (the dither progress bar, the pattern meter, dither area fills and the veil) look the same in every renderer. A renderer that skips mode 5 still draws everything else.
 
+## Instances (40 bytes)
+
+With `cui_ctx_desc.instanced_quads` set, an axis-aligned shape (a rounded rectangle, a shadow, an image, a glyph) is one `cui_instance` in `cui_draw_data.instances` instead of four vertices. Lines, polygons, dither meshes and anything that does not fit a record stay vertices, in the same draw data. A draw command is one kind or the other: `index_count` or `instance_count`, never both, and the commands are still in draw order.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `x0, y0, x1, y1` | 4 × int16 | The shape's bounds in quarter pixels |
+| `u0, v0, u1, v1` | 4 × uint16 | Its texture rectangle, 0..65535 across the texture |
+| `r_tl, r_tr, r_br, r_bl` | 4 × uint16 | Corner radii in quarter pixels |
+| `param` | uint16 | Border width (RRECT) or blur sigma (SHADOW), quarter pixels |
+| `mode` | uint8 | `CUI_SHADE_TEXT`, `RRECT`, `SHADOW` or `IMAGE` |
+| `reserved` | uint8 | Zero |
+| `color_top`, `color_bottom` | 2 × RGBA8 | The fill at the top and bottom edge (the same for a plain fill) |
+| `border_color` | RGBA8 | |
+
+The quad a record stands for is its shape grown on every side by a margin the mode decides: 1 pixel for RRECT and IMAGE, three times the blur sigma for SHADOW, none for TEXT. Its four corners feed the fragment shader exactly what four vertices would: `cui_instance_vertices` writes them out, and is the definition.
+
+A renderer has two ways to take records:
+
+- **Draw them as instances.** One four-vertex strip per record, with the corner from the vertex index. Vulkan reads a record as per-instance vertex input and picks a command's first record with the draw's first instance. OpenGL 3.3, OpenGL ES 3.0 and WebGL 2 have no first instance, so the OpenGL renderer uploads the records as a texture of 32-bit words, sets one integer uniform to the command's first record, and reads record `first + gl_InstanceID` with `texelFetch`.
+- **Write them back out as vertices.** `cui_expand_instances` returns draw data with every record as four vertices and six indices, in the same order, for a renderer that draws vertices only. The software, Direct3D 12 and Metal renderers do this.
+
 ## Reference shader (GLSL 330)
 
 ```glsl

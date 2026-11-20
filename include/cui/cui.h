@@ -185,6 +185,9 @@ typedef struct cui_ctx_desc {
     cui_accent accent;
     bool no_default_fonts;            /* skip the embedded Inter/Geist/Lucide fonts */
     cui_direction direction;
+    /* Rounded rectangles, shadows, images and glyphs go to the draw data as cui_instance
+     * records instead of four vertices each; see docs/rendering.md. Default: off. */
+    bool instanced_quads;
 } cui_ctx_desc;
 
 CUI_API cui_ctx *cui_create(const cui_ctx_desc *desc);
@@ -5049,11 +5052,29 @@ typedef struct cui_vertex {
     cui_color border_color;
 } cui_vertex;
 
+/* One axis-aligned shape, expanded to a quad by the renderer. Lengths are in quarter pixels.
+ * The quad is the shape grown on every side by a margin the mode decides: 1 pixel for RRECT and
+ * IMAGE, three times the blur sigma for SHADOW, none for TEXT. 40 bytes, no padding. */
+typedef struct cui_instance {
+    int16_t x0, y0, x1, y1;            /* shape bounds, quarter pixels */
+    uint16_t u0, v0, u1, v1;           /* texture rectangle of the shape, 0..65535 across the texture */
+    uint16_t r_tl, r_tr, r_br, r_bl;   /* corner radii, quarter pixels */
+    uint16_t param;                    /* border width (RRECT) or blur sigma (SHADOW), quarter pixels */
+    uint8_t mode;                      /* CUI_SHADE_TEXT, RRECT, SHADOW or IMAGE */
+    uint8_t reserved;
+    cui_color color_top;               /* fill at the top edge */
+    cui_color color_bottom;            /* fill at the bottom edge */
+    cui_color border_color;
+} cui_instance;
+
+/* A command draws either indexed triangles (index_count) or instances (instance_count), never both. */
 typedef struct cui_draw_cmd {
     cui_rect clip;         /* pixels */
     cui_texture texture;   /* 0 = font atlas */
     uint32_t index_offset;
     uint32_t index_count;
+    uint32_t instance_offset;
+    uint32_t instance_count;
 } cui_draw_cmd;
 
 typedef struct cui_draw_data {
@@ -5066,7 +5087,13 @@ typedef struct cui_draw_data {
     int width_px, height_px;   /* framebuffer size */
     cui_color clear_color;
     cui_texture font_atlas;
+    const cui_instance *instances;   /* empty unless cui_ctx_desc.instanced_quads */
+    int instance_count;
 } cui_draw_data;
+
+/* The four vertices an instance stands for, in the order top left, top right, bottom right,
+ * bottom left, for a renderer that draws vertices only. */
+CUI_API void cui_instance_vertices(const cui_instance *instance, cui_vertex out[4]);
 
 /* Valid after cui_end_frame until the next cui_begin_frame. */
 CUI_API const cui_draw_data *cui_get_draw_data(cui_ctx *ui);

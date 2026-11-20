@@ -52,6 +52,24 @@ CUI_API bool cui_sw_last_damage(const cui_sw_renderer *r, int *x, int *y, int *w
 /* Writes a PNG file (RGBA pixels). Returns false on failure. */
 CUI_API bool cui_write_png(const char *path, const void *rgba, int width, int height, int stride);
 
+/* ---- Instances as vertices ---- */
+
+/* For a renderer that draws vertices only: draw data whose cui_instance records
+ * (cui_ctx_desc.instanced_quads) are written out as four vertices and six indices each, in
+ * the same draw order. Keep one zeroed cui_expanded with the renderer and free it with it. */
+typedef struct cui_expanded {
+    cui_vertex *vertices;
+    uint32_t *indices;
+    cui_draw_cmd *commands;
+    int vertex_cap, index_cap, command_cap;
+    cui_draw_data data;
+} cui_expanded;
+
+/* dd itself when it has no instances, otherwise &e->data, valid until the next call with e.
+ * NULL when memory runs out. */
+CUI_API const cui_draw_data *cui_expand_instances(cui_expanded *e, const cui_draw_data *dd);
+CUI_API void cui_expanded_free(cui_expanded *e);
+
 /* ---- OpenGL renderer ---- */
 
 typedef void *(*cui_gl_loader)(const char *name);

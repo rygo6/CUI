@@ -40,6 +40,8 @@ struct cui_sw_renderer {
     /* texture parts written since the last frame: triangles sampling them are drawn again
      * (new glyphs go to unused parts, so text already on screen stays put) */
     struct { cui_texture t; int x0, y0, x1, y1; } changed[32];
+    /* draw data with its instances written out as vertices, which is all this renderer draws */
+    cui_expanded expanded;
     int nchanged; bool changed_overflow;
 };
 
@@ -146,6 +148,7 @@ void cui_sw_destroy(cui_sw_renderer *r) {
     free(r->tiles);
     free(r->prev);
     free(r->force);
+    cui_expanded_free(&r->expanded);
     free(r);
 }
 
@@ -693,6 +696,8 @@ static void cui__sw_tile_hashes(cui_sw_renderer *r, const cui_draw_data *dd, uin
 
 void cui_sw_render(cui_sw_renderer *r, const cui_draw_data *dd, void *pixels, int width, int height, int stride, cui_sw_format fmt) {
     if (!r || !dd || !pixels) return;
+    dd = cui_expand_instances(&r->expanded, dd);
+    if (!dd) return;
     if (!r->incremental) {
         r->nchanged = 0; r->changed_overflow = false;
         cui__sw_paint_rect(r, dd, pixels, width, height, stride, fmt, 0, 0, width, height);

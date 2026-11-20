@@ -2,14 +2,16 @@
  * and shadows are signed distance fields evaluated per pixel, so corners
  * stay smooth at any size and DPI. Paths use feathered geometry. */
 #include "cui_internal.h"
+#include "cui/cui_render.h"
 
-static cui_draw_cmd *cui__cmd(cui_ctx *ui) {
+static cui_draw_cmd *cui__cmd_of(cui_ctx *ui, bool instanced) {
     cui_draw_list *dl = &ui->dl;
     cui_rect clip = dl->clip_stack[dl->clip_depth - 1];
     if (dl->cmd_count > 0) {
         cui_draw_cmd *c = &dl->cmd[dl->cmd_count - 1];
-        if (c->texture == dl->cur_tex && memcmp(&c->clip, &clip, sizeof clip) == 0) return c;
-        if (c->index_count == 0) { c->texture = dl->cur_tex; c->clip = clip; return c; }
+        bool same_kind = instanced ? c->index_count == 0 : c->instance_count == 0;
+        if (same_kind && c->texture == dl->cur_tex && memcmp(&c->clip, &clip, sizeof clip) == 0) return c;
+        if (c->index_count == 0 && c->instance_count == 0) { c->texture = dl->cur_tex; c->clip = clip; return c; }
     }
     CUI__GROW(ui, dl->cmd, dl->cmd_count, dl->cmd_cap, 1);
     cui_draw_cmd *c = &dl->cmd[dl->cmd_count++];
@@ -17,12 +19,16 @@ static cui_draw_cmd *cui__cmd(cui_ctx *ui) {
     c->texture = dl->cur_tex;
     c->index_offset = (uint32_t)dl->idx_count;
     c->index_count = 0;
+    c->instance_offset = (uint32_t)dl->inst_count;
+    c->instance_count = 0;
     return c;
 }
 
+static cui_draw_cmd *cui__cmd(cui_ctx *ui) { return cui__cmd_of(ui, false); }
+
 void cui__draw_reset(cui_ctx *ui) {
     cui_draw_list *dl = &ui->dl;
-    dl->vtx_count = dl->idx_count = dl->cmd_count = 0;
+    dl->vtx_count = dl->idx_count = dl->cmd_count = dl->inst_count = 0;
     dl->clip_depth = 1;
     cui_rect full = { 0, 0, ui->vw * ui->scale, ui->vh * ui->scale };
     dl->clip_stack[0] = full;
@@ -102,6 +108,122 @@ static bool cui__clip_rejects(cui_ctx *ui, float x0, float y0, float x1, float y
     return x1 < c.x || y1 < c.y || x0 > c.x + c.w || y0 > c.y + c.h || c.w <= 0 || c.h <= 0;
 }
 
+/* ---- instances ---- */
+
+typedef char cui__instance_is_40_bytes[sizeof(cui_instance) == 40 ? 1 : -1];
+
+static bool cui__quarter(float v, float lo, float hi, int *out) {
+    float q = v * 4.0f;
+    q = q < 0 ? q - 0.5f : q + 0.5f;
+    if (!(q >= lo && q <= hi)) return false;
+    *out = (int)q;
+    return true;
+}
+
+static bool cui__unit16(float v, int *out) {
+    if (!(v >= 0.0f && v <= 1.0f)) return false;
+    *out = (int)(v * 65535.0f + 0.5f);
+    return true;
+}
+
+static bool cui__same_color(cui_color a, cui_color b) { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a; }
+
+static cui_instance *cui__reserve_instance(cui_ctx *ui) {
+    cui_draw_list *dl = &ui->dl;
+    cui_draw_cmd *c = cui__cmd_of(ui, true);
+    CUI__GROW(ui, dl->inst, dl->inst_count, dl->inst_cap, 1);
+    cui_instance *in = &dl->inst[dl->inst_count++];
+    memset(in, 0, sizeof *in);
+    c->instance_count++;
+    return in;
+}
+
+/* The values of one shape as quarter pixels and texture fractions; false when one does not fit. */
+typedef struct { int x0, y0, x1, y1, u0, v0, u1, v1, r[4], param; } cui__packed;
+
+static bool cui__pack(cui__packed *p, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1,
+                      const float r[4], float param) {
+    bool ok = cui__quarter(x0, -32768, 32767, &p->x0) && cui__quarter(y0, -32768, 32767, &p->y0);
+    ok = ok && cui__quarter(x1, -32768, 32767, &p->x1) && cui__quarter(y1, -32768, 32767, &p->y1);
+    ok = ok && cui__unit16(u0, &p->u0) && cui__unit16(v0, &p->v0) && cui__unit16(u1, &p->u1) && cui__unit16(v1, &p->v1);
+    for (int i = 0; i < 4; i++) ok = ok && cui__quarter(r[i], 0, 65535, &p->r[i]);
+    return ok && cui__quarter(param, 0, 65535, &p->param) && p->x1 > p->x0 && p->y1 > p->y0;
+}
+
+static void cui__emit_instance(cui_ctx *ui, const cui__packed *p, int mode, cui_color top, cui_color bottom, cui_color border) {
+    cui_instance *in = cui__reserve_instance(ui);
+    in->x0 = (int16_t)p->x0; in->y0 = (int16_t)p->y0; in->x1 = (int16_t)p->x1; in->y1 = (int16_t)p->y1;
+    in->u0 = (uint16_t)p->u0; in->v0 = (uint16_t)p->v0; in->u1 = (uint16_t)p->u1; in->v1 = (uint16_t)p->v1;
+    in->r_tl = (uint16_t)p->r[0]; in->r_tr = (uint16_t)p->r[1]; in->r_br = (uint16_t)p->r[2]; in->r_bl = (uint16_t)p->r[3];
+    in->param = (uint16_t)p->param;
+    in->mode = (uint8_t)mode;
+    in->color_top = top; in->color_bottom = bottom; in->border_color = border;
+}
+
+void cui_instance_vertices(const cui_instance *in, cui_vertex v[4]) {
+    float x0 = in->x0 * 0.25f, y0 = in->y0 * 0.25f, x1 = in->x1 * 0.25f, y1 = in->y1 * 0.25f;
+    float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f, hw = (x1 - x0) * 0.5f, hh = (y1 - y0) * 0.5f;
+    float param = in->param * 0.25f;
+    float pad = in->mode == CUI_SHADE_SHADOW ? param * 3.0f : (in->mode == CUI_SHADE_RRECT || in->mode == CUI_SHADE_IMAGE) ? 1.0f : 0.0f;
+    float u0 = in->u0 / 65535.0f, v0 = in->v0 / 65535.0f, u1 = in->u1 / 65535.0f, v1 = in->v1 / 65535.0f;
+    float px[4] = { x0 - pad, x1 + pad, x1 + pad, x0 - pad }, py[4] = { y0 - pad, y0 - pad, y1 + pad, y1 + pad };
+    memset(v, 0, sizeof(cui_vertex) * 4);
+    for (int i = 0; i < 4; i++) {
+        v[i].x = px[i]; v[i].y = py[i];
+        v[i].lx = px[i] - cx; v[i].ly = py[i] - cy;
+        v[i].hw = hw; v[i].hh = hh;
+        v[i].u = u0 + (v[i].lx + hw) / (2 * hw) * (u1 - u0);
+        v[i].v = v0 + (v[i].ly + hh) / (2 * hh) * (v1 - v0);
+        v[i].r_tl = in->r_tl * 0.25f; v[i].r_tr = in->r_tr * 0.25f; v[i].r_br = in->r_br * 0.25f; v[i].r_bl = in->r_bl * 0.25f;
+        v[i].border = param;
+        v[i].mode = (float)in->mode;
+        v[i].color = i < 2 ? in->color_top : in->color_bottom;
+        v[i].border_color = in->border_color;
+    }
+}
+
+const cui_draw_data *cui_expand_instances(cui_expanded *e, const cui_draw_data *dd) {
+    if (!dd || dd->instance_count <= 0) return dd;
+    int nv = dd->vertex_count + dd->instance_count * 4, ni = dd->index_count + dd->instance_count * 6;
+    if (nv > e->vertex_cap) { cui_vertex *p = realloc(e->vertices, sizeof *p * (size_t)nv); if (!p) return NULL; e->vertices = p; e->vertex_cap = nv; }
+    if (ni > e->index_cap) { uint32_t *p = realloc(e->indices, sizeof *p * (size_t)ni); if (!p) return NULL; e->indices = p; e->index_cap = ni; }
+    if (dd->command_count > e->command_cap) {
+        cui_draw_cmd *p = realloc(e->commands, sizeof *p * (size_t)dd->command_count);
+        if (!p) return NULL;
+        e->commands = p; e->command_cap = dd->command_count;
+    }
+    if (dd->vertex_count) memcpy(e->vertices, dd->vertices, sizeof(cui_vertex) * (size_t)dd->vertex_count);
+    if (dd->index_count) memcpy(e->indices, dd->indices, sizeof(uint32_t) * (size_t)dd->index_count);
+    int v = dd->vertex_count, x = dd->index_count;
+    for (int i = 0; i < dd->command_count; i++) {
+        cui_draw_cmd c = dd->commands[i];
+        if (c.instance_count) {
+            c.index_offset = (uint32_t)x;
+            c.index_count = c.instance_count * 6;
+            for (uint32_t k = 0; k < c.instance_count; k++, v += 4, x += 6) {
+                cui_instance_vertices(&dd->instances[c.instance_offset + k], &e->vertices[v]);
+                uint32_t b = (uint32_t)v;
+                uint32_t *ix = &e->indices[x];
+                ix[0] = b; ix[1] = b + 1; ix[2] = b + 2; ix[3] = b; ix[4] = b + 2; ix[5] = b + 3;
+            }
+            c.instance_offset = c.instance_count = 0;
+        }
+        e->commands[i] = c;
+    }
+    e->data = *dd;
+    e->data.vertices = e->vertices; e->data.vertex_count = nv;
+    e->data.indices = e->indices; e->data.index_count = ni;
+    e->data.commands = e->commands;
+    e->data.instances = NULL; e->data.instance_count = 0;
+    return &e->data;
+}
+
+void cui_expanded_free(cui_expanded *e) {
+    if (!e) return;
+    free(e->vertices); free(e->indices); free(e->commands);
+    memset(e, 0, sizeof *e);
+}
+
 /* Emits one SDF quad in pixel space (before transform). */
 static void cui__sdf_quad(cui_ctx *ui, float cx, float cy, float hw, float hh, float expand,
                           cui_corners rad, float border, int mode,
@@ -116,12 +238,22 @@ static void cui__sdf_quad(cui_ctx *ui, float cx, float cy, float hw, float hh, f
     if (cui__clip_rejects(ui, x0, y0, x1, y1)) return;
     float a = x.alpha;
     cui__set_texture(ui, tex);
+    float maxr = CUI_MIN(nhw, nhh);
+    if (ui->dl.instanced && !ui->dl.vertices_only && cui__same_color(c_tl, c_tr) && cui__same_color(c_bl, c_br)) {
+        bool shadow = mode == CUI_SHADE_SHADOW;
+        float r[4] = { rad.tl * s, rad.tr * s, rad.br * s, rad.bl * s };
+        for (int i = 0; i < 4 && !shadow; i++) r[i] = CUI_MIN(r[i], maxr);
+        cui__packed p;
+        if (cui__pack(&p, ncx - nhw, ncy - nhh, ncx + nhw, ncy + nhh, u0, v0, u1, v1, r, border * s)) {
+            cui__emit_instance(ui, &p, mode, cui__xa(c_tl, a), cui__xa(c_bl, a), cui__xa(bc, a));
+            return;
+        }
+    }
     uint32_t base;
     cui_vertex *v = cui__reserve(ui, 4, 6, &base);
     float px[4] = { x0, x1, x1, x0 }, py[4] = { y0, y0, y1, y1 };
     float uu[4] = { u0, u1, u1, u0 }, vv[4] = { v0, v0, v1, v1 };
     cui_color cc[4] = { c_tl, c_tr, c_br, c_bl };
-    float maxr = CUI_MIN(nhw, nhh);
     for (int i = 0; i < 4; i++) {
         v[i].x = px[i]; v[i].y = py[i];
         v[i].lx = px[i] - ncx; v[i].ly = py[i] - ncy;
@@ -219,6 +351,18 @@ void cui__draw_glyph_quad(cui_ctx *ui, float x0, float y0, float x1, float y1,
     }
     if (cui__clip_rejects(ui, x0, y0, x1, y1)) return;
     cui__set_texture(ui, 0);
+    if (ui->dl.instanced && !ui->dl.vertices_only) {
+        static const float square[4] = { 0, 0, 0, 0 };
+        cui__packed p;
+        /* the size is kept exact, so a glyph is not resampled when its origin lands between quarter pixels */
+        if (cui__pack(&p, x0, y0, x1, y1, u0, v0, u1, v1, square, 0) && cui__quarter(x1 - x0, 1, 65535, &p.x1) && cui__quarter(y1 - y0, 1, 65535, &p.y1)) {
+            p.x1 += p.x0; p.y1 += p.y0;
+            if (p.x1 <= 32767 && p.y1 <= 32767) {
+                cui__emit_instance(ui, &p, CUI_SHADE_TEXT, c, c, c);
+                return;
+            }
+        }
+    }
     uint32_t base;
     cui_vertex *v = cui__reserve(ui, 4, 6, &base);
     float px[4] = { x0, x1, x1, x0 }, py[4] = { y0, y0, y1, y1 };

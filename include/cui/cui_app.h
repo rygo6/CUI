@@ -70,6 +70,7 @@ typedef struct cui_app_desc {
     bool continuous;            /* render every frame even when idle (games, video) */
     bool no_vsync;              /* OpenGL: do not wait for the display; frames are capped at 120 Hz or the refresh rate */
     bool hidden;                /* create the window hidden (tests) */
+    bool instanced_quads;       /* cui_ctx_desc.instanced_quads: compact shape records in the draw data; CUI_INSTANCED=1 sets it too */
     cui_renderer_kind renderer;
     cui_theme_mode theme;
     cui_accent accent;
