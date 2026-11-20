@@ -66,7 +66,8 @@ struct cui_gpu_renderer {
     VkCommandBuffer cmd[CUI__TV_FRAMES];
     uint64_t cmd_value[CUI__TV_FRAMES];
     cui__vk_buffer upload[CUI__TV_FRAMES];
-    int frame;                      /* the command buffer being recorded */
+    cui__vk_buffer kept;            /* a captured frame whose copy was not known to be done: freed at teardown */
+    int frame;                     /* the command buffer being recorded */
     bool open;
     VkSemaphore timeline;
     uint64_t value;                 /* the last submission's */
@@ -803,6 +804,7 @@ void cui_gpu_destroy(cui_gpu_renderer *r) {
         if (r->set_pool) vkDestroyDescriptorPool(dev, r->set_pool, NULL);
         if (r->sampler) vkDestroySampler(dev, r->sampler, NULL);
         for (int i = 0; i < CUI__TV_FRAMES; i++) cui__vk_buffer_free(r, &r->upload[i]);
+        cui__vk_buffer_free(r, &r->kept);
         if (r->pool) vkDestroyCommandPool(dev, r->pool, NULL);
         if (r->timeline) vkDestroySemaphore(dev, r->timeline, NULL);
     }
@@ -996,9 +998,7 @@ static bool cui__vk_read_back(cui_gpu_renderer *r, cui__vk_frame *f, const cui_d
     bool ok = !rgba;
     if (f->readback.buffer) {
         if (!cui__vk_wait(r, r->value)) {   /* the copy may still be writing it: it goes when the renderer does */
-            cui__vk_later l = { 0 };
-            l.buffer = f->readback.buffer; l.memory = f->readback.memory; l.slot = -1;
-            cui__vk_release_later(r, l);
+            r->kept = f->readback;          /* (a failed wait stops the renderer, so there is only ever one) */
             memset(&f->readback, 0, sizeof f->readback);
             return false;
         }
