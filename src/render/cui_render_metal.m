@@ -381,6 +381,7 @@ static id<MTLBuffer> cui__mtl_copy_out(CUIMetalWindow *w, id<MTLCommandBuffer> c
     id<MTLBuffer> readback = [w.device newBufferWithLength:pitch * (NSUInteger)fh options:MTLResourceStorageModeShared];
     if (readback) {
         id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        if (!blit) return nil;   /* (no copy: no capture) */
         [blit copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                    sourceSize:MTLSizeMake((NSUInteger)fw, (NSUInteger)fh, 1)
                      toBuffer:readback destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * (NSUInteger)fh];

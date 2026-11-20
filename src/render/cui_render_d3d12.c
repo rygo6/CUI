@@ -510,7 +510,7 @@ static bool cui__d3d12_device(cui_gpu_renderer *r) {
     static const uint8_t black[4] = { 0, 0, 0, 255 };   /* what OpenGL samples from no texture */
     r->none = (int)cui__d3d12_tex_create(r, 1, 1, CUI_TEXTURE_RGBA8, black) - 1;
     cui__d3d12_idle(r);
-    return r->none >= 0;
+    return r->none >= 0 && !r->lost;   /* (a renderer that stopped while starting is none: the app draws with OpenGL) */
 }
 
 /* ---- the window ---- */
