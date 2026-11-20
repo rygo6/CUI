@@ -417,6 +417,7 @@ static bool cui__mtl_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *
         int tw = (int)drawable.texture.width, th = (int)drawable.texture.height;
         id<MTLCommandBuffer> cmd = [w.queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = cui__mtl_encoder(cmd, drawable, dd);
+        if (!enc) return false;   /* (no pass: nothing drawn, nothing to show or capture) */
         if (any) cui__mtl_draw(w, enc, slot, dd, tw, th);
         [enc endEncoding];
 

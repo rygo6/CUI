@@ -142,17 +142,26 @@ static void cui__vk_buffer_free(cui_gpu_renderer *r, cui__vk_buffer *b) {
 
 /* ---- submissions ---- */
 
-static void cui__vk_wait(cui_gpu_renderer *r, uint64_t value) {
-    if (value == 0) return;
-    if (r->lost) { vkDeviceWaitIdle(r->device); return; }   /* (a submission failed: the timeline does not reach it) */
+/* True when nothing runs on the device any more (it is idle, or lost). */
+static bool cui__vk_idle_or_gone(cui_gpu_renderer *r) {
+    VkResult res = vkDeviceWaitIdle(r->device);
+    return res == VK_SUCCESS || res == VK_ERROR_DEVICE_LOST;
+}
+
+/* Waits until the submission that signals `value` is done. False when that is not known (the
+ * wait failed and the device could not be made idle): what the submission uses must stay. */
+static bool cui__vk_wait(cui_gpu_renderer *r, uint64_t value) {
+    if (value == 0) return true;
+    if (r->lost) return cui__vk_idle_or_gone(r);   /* (a submission failed: the timeline does not reach it) */
     VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
     info.semaphoreCount = 1;
     info.pSemaphores = &r->timeline;
     info.pValues = &value;
-    if (vkWaitSemaphores(r->device, &info, UINT64_MAX) != VK_SUCCESS) {   /* (the device is gone: nothing more is drawn) */
+    if (vkWaitSemaphores(r->device, &info, UINT64_MAX) != VK_SUCCESS) {   /* (nothing more is drawn) */
         r->lost = true;
-        vkDeviceWaitIdle(r->device);
+        return cui__vk_idle_or_gone(r);
     }
+    return true;
 }
 
 static void cui__vk_later_free(cui_gpu_renderer *r, const cui__vk_later *l) {
@@ -190,15 +199,19 @@ static void cui__vk_release_later(cui_gpu_renderer *r, cui__vk_later l) {
     r->later[r->later_count++] = l;
 }
 
-/* the open command buffer, begun on the next one once its last submission is done */
+/* The open command buffer, begun on the next one once its last submission is done. Null when
+ * the renderer has stopped or the buffer will not begin: the caller records nothing. */
 static VkCommandBuffer cui__vk_cmd(cui_gpu_renderer *r) {
+    if (r->lost) return VK_NULL_HANDLE;
     if (!r->open) {
         int f = r->frame;
-        cui__vk_wait(r, r->cmd_value[f]);
+        if (!cui__vk_wait(r, r->cmd_value[f]) || r->lost) return VK_NULL_HANDLE;   /* (its last submission may still run: it is not reset) */
         VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        /* a buffer that could not be begun records nothing; cui__vk_submit then leaves it out */
-        if (vkResetCommandBuffer(r->cmd[f], 0) != VK_SUCCESS || vkBeginCommandBuffer(r->cmd[f], &begin) != VK_SUCCESS) r->lost = true;
+        if (vkResetCommandBuffer(r->cmd[f], 0) != VK_SUCCESS || vkBeginCommandBuffer(r->cmd[f], &begin) != VK_SUCCESS) {
+            r->lost = true;
+            return VK_NULL_HANDLE;
+        }
         r->upload[f].used = 0;
         r->open = true;
     }
@@ -276,12 +289,13 @@ static void cui__vk_barrier(cui_gpu_renderer *r, VkImage image, VkImageLayout fr
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(cui__vk_cmd(r), src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+    VkCommandBuffer cmd = cui__vk_cmd(r);
+    if (cmd) vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
 /* room in the open command buffer's upload buffer, valid until its submission is done */
 static uint8_t *cui__vk_upload(cui_gpu_renderer *r, size_t bytes, size_t align, VkBuffer *buffer, size_t *offset) {
-    cui__vk_cmd(r);
+    if (!cui__vk_cmd(r)) return NULL;
     cui__vk_buffer *u = &r->upload[r->frame];
     size_t at = (u->used + align - 1) & ~(align - 1);
     if (!u->buffer || at + bytes > u->cap) {
@@ -392,6 +406,13 @@ static cui_texture cui__vk_tex_create(void *user, int w, int h, cui_texture_form
     r->tex[slot] = made;
     if (pixels && !cui__vk_tex_upload(r, &r->tex[slot], 0, 0, w, h, pixels, 0, true)) {
         /* no texture without its pixels: the caller is told, and can make it again (no command uses it yet) */
+        cui__vk_later gone = { 0 };
+        gone.image = made.image; gone.view = made.view; gone.memory = made.memory; gone.set = made.set; gone.slot = slot;
+        memset(&r->tex[slot], 0, sizeof r->tex[slot]);
+        cui__vk_later_free(r, &gone);
+        return 0;
+    }
+    if (!pixels && !cui__vk_cmd(r)) {   /* (stopped: no texture) */
         cui__vk_later gone = { 0 };
         gone.image = made.image; gone.view = made.view; gone.memory = made.memory; gone.set = made.set; gone.slot = slot;
         memset(&r->tex[slot], 0, sizeof r->tex[slot]);
@@ -832,6 +853,7 @@ typedef struct cui__vk_frame {
 static bool cui__vk_acquire(cui_gpu_renderer *r, cui__vk_frame *f) {
     VkDevice dev = r->device;
     f->cmd = cui__vk_cmd(r);
+    if (!f->cmd) return false;
     f->acquire = r->acquire_sem[r->frame];
     bool acquired = false;
     for (int attempt = 0; attempt < 2 && !acquired; attempt++) {
@@ -840,6 +862,7 @@ static bool cui__vk_acquire(cui_gpu_renderer *r, cui__vk_frame *f) {
             vkDeviceWaitIdle(dev);
             if (!cui__vk_swapchain(r)) break;
             f->cmd = cui__vk_cmd(r);
+            if (!f->cmd) return false;
             f->acquire = r->acquire_sem[r->frame];
         }
         VkResult res = vkAcquireNextImageKHR(dev, r->swapchain, UINT64_MAX, f->acquire, VK_NULL_HANDLE, &r->image);
@@ -962,7 +985,10 @@ static void cui__vk_present(cui_gpu_renderer *r, const cui__vk_frame *f) {
 static bool cui__vk_read_back(cui_gpu_renderer *r, cui__vk_frame *f, const cui_draw_data *dd, void *rgba) {
     bool ok = !rgba;
     if (f->readback.buffer) {
-        cui__vk_wait(r, r->value);
+        if (!cui__vk_wait(r, r->value)) {   /* the copy may still be writing it: it is left alone */
+            memset(&f->readback, 0, sizeof f->readback);
+            return false;
+        }
         int w = (int)r->extent.width, h = (int)r->extent.height;
         if (!r->lost && w == dd->width_px && h == dd->height_px) {
             const uint8_t *src = f->readback.ptr;

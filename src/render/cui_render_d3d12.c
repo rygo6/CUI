@@ -118,7 +118,7 @@ struct cui_gpu_renderer {
     bool open;
     int frame;                        /* the allocator being recorded */
     ID3D12Fence *fence;
-    uint64_t fence_value;             /* the last submission's */
+    uint64_t fence_value;             /* the last value the queue was told to signal: everything waited for is at or below it */
     HANDLE event;
     ID3D12DescriptorHeap *srv_heap, *rtv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu, rtv_cpu;
@@ -186,13 +186,17 @@ static void cui__d3d12_release_later(cui_gpu_renderer *r, IUnknown *obj, int slo
     r->later[r->later_count++] = l;
 }
 
-/* the open command list, opened on the next allocator once its last submission is done */
+/* The open command list, opened on the next allocator once its last submission is done. NULL
+ * when the renderer has stopped or the list will not open: the caller records nothing. */
 static ID3D12GraphicsCommandList *cui__d3d12_cmd(cui_gpu_renderer *r) {
+    if (r->lost) return NULL;
     if (!r->open) {
         int f = r->frame;
         cui__d3d12_wait(r, r->alloc_fence[f]);
-        /* a list that could not be opened records nothing; cui__d3d12_submit then leaves it out */
-        if (FAILED(r->alloc[f]->lpVtbl->Reset(r->alloc[f])) || FAILED(r->list->lpVtbl->Reset(r->list, r->alloc[f], NULL))) cui__d3d12_lose(r);
+        if (FAILED(r->alloc[f]->lpVtbl->Reset(r->alloc[f])) || FAILED(r->list->lpVtbl->Reset(r->list, r->alloc[f], NULL))) {
+            cui__d3d12_lose(r);
+            return NULL;
+        }
         r->upload[f].used = 0;
         r->open = true;
     }
@@ -208,8 +212,12 @@ static void cui__d3d12_submit(cui_gpu_renderer *r) {
         return;
     }
     r->queue->lpVtbl->ExecuteCommandLists(r->queue, 1, (ID3D12CommandList **)&list);
-    r->queue->lpVtbl->Signal(r->queue, r->fence, ++r->fence_value);
-    r->alloc_fence[r->frame] = r->fence_value;
+    r->open = false;
+    if (FAILED(r->queue->lpVtbl->Signal(r->queue, r->fence, r->fence_value + 1))) {   /* a value the fence would never reach is not waited for */
+        cui__d3d12_lose(r);
+        return;
+    }
+    r->alloc_fence[r->frame] = ++r->fence_value;
     r->frame = (r->frame + 1) % CUI__T12_FRAMES;
     r->open = false;
     cui__d3d12_collect(r, false);
@@ -237,7 +245,8 @@ static void cui__d3d12_barrier(cui_gpu_renderer *r, ID3D12Resource *res, D3D12_R
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = from;
     b.Transition.StateAfter = to;
-    cui__d3d12_cmd(r)->lpVtbl->ResourceBarrier(r->list, 1, &b);
+    ID3D12GraphicsCommandList *list = cui__d3d12_cmd(r);
+    if (list) list->lpVtbl->ResourceBarrier(list, 1, &b);
 }
 
 /* a mapped buffer of `cap` bytes in a heap of that type */
@@ -263,7 +272,7 @@ static bool cui__d3d12_buffer_make(cui_gpu_renderer *r, cui__d3d12_buffer *b, si
 
 /* room in the open list's upload buffer, valid until its submission is done */
 static uint8_t *cui__d3d12_upload(cui_gpu_renderer *r, size_t bytes, size_t align, D3D12_GPU_VIRTUAL_ADDRESS *va, ID3D12Resource **res, size_t *offset) {
-    cui__d3d12_cmd(r);
+    if (!cui__d3d12_cmd(r)) return NULL;
     cui__d3d12_buffer *u = &r->upload[r->frame];
     size_t at = (u->used + align - 1) & ~(align - 1);
     if (!u->res || at + bytes > u->cap) {
@@ -345,6 +354,11 @@ static cui_texture cui__d3d12_tex_create(void *user, int w, int h, cui_texture_f
     r->device->lpVtbl->CreateShaderResourceView(r->device, t->res, NULL, at);
     if (pixels && !cui__d3d12_tex_upload(r, t, 0, 0, w, h, pixels, 0, true)) {
         /* no texture without its pixels: the caller is told, and can make it again (no command uses it yet) */
+        CUI__REL(t->res);
+        t->bpp = 0;
+        return 0;
+    }
+    if (!pixels && !cui__d3d12_cmd(r)) {   /* (stopped: no texture) */
         CUI__REL(t->res);
         t->bpp = 0;
         return 0;
@@ -510,7 +524,8 @@ static bool cui__d3d12_device(cui_gpu_renderer *r) {
     static const uint8_t black[4] = { 0, 0, 0, 255 };   /* what OpenGL samples from no texture */
     r->none = (int)cui__d3d12_tex_create(r, 1, 1, CUI_TEXTURE_RGBA8, black) - 1;
     cui__d3d12_idle(r);
-    return r->none >= 0 && !r->lost;   /* (a renderer that stopped while starting is none: the app draws with OpenGL) */
+    /* a renderer that stopped while starting, or whose device went away, is none: the app draws with OpenGL */
+    return r->none >= 0 && !r->lost && SUCCEEDED(dev->lpVtbl->GetDeviceRemovedReason(dev));
 }
 
 /* ---- the window ---- */
@@ -553,6 +568,14 @@ static bool cui__d3d12_swapchain(cui_gpu_renderer *r) {
 
 void cui_gpu_destroy(cui_gpu_renderer *r) {
     if (!r) return;
+    /* Stopped on a device that is still there: work may be running that no fence value accounts
+     * for. What it uses is left alone; only the memory on this side is given back. */
+    if (r->lost && r->device && SUCCEEDED(r->device->lpVtbl->GetDeviceRemovedReason(r->device))) {
+        free(r->later);
+        free(r->tex);
+        free(r);
+        return;
+    }
     if (r->queue && r->fence) { cui__d3d12_idle(r); cui__d3d12_collect(r, true); }
     free(r->later);
     for (int i = 0; i < CUI__T12_BUFFERS; i++) CUI__REL(r->buffers[i]);
@@ -621,6 +644,7 @@ static bool cui__d3d12_acquire(cui_gpu_renderer *r, cui__d3d12_frame *f, const c
         }
     }
     f->cmd = cui__d3d12_cmd(r);
+    if (!f->cmd) return false;
     f->bb = (int)r->swapchain->lpVtbl->GetCurrentBackBufferIndex(r->swapchain);
     cui__d3d12_barrier(r, r->buffers[f->bb], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = cui__d3d12_rtv_at(r, f->bb);
@@ -707,10 +731,13 @@ static void cui__d3d12_copy_out(cui_gpu_renderer *r, cui__d3d12_frame *f, bool w
 
 static void cui__d3d12_present(cui_gpu_renderer *r) {
     cui__d3d12_submit(r);
+    if (r->lost) return;   /* (the frame was not submitted: there is nothing to present) */
     bool tear = !r->vsync && r->tearing;
     HRESULT shown = r->swapchain->lpVtbl->Present(r->swapchain, r->vsync ? 1 : 0, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (shown == DXGI_ERROR_DEVICE_REMOVED || shown == DXGI_ERROR_DEVICE_RESET) cui__d3d12_lose(r);
-    r->queue->lpVtbl->Signal(r->queue, r->fence, ++r->fence_value);   /* so that idle waits for the present too (a resize releases the back buffers) */
+    /* so that idle waits for the present too (a resize releases the back buffers) */
+    if (SUCCEEDED(r->queue->lpVtbl->Signal(r->queue, r->fence, r->fence_value + 1))) r->fence_value++;
+    else cui__d3d12_lose(r);
 }
 
 /* Waits for the copy and writes it as RGBA; false if one was asked for and could not be made. */
