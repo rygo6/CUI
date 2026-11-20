@@ -137,7 +137,7 @@ typedef struct cui__wl {
     float scale;
     int normal_w, normal_h;         /* content size while neither maximized nor fullscreen */
     int pending_w, pending_h;       /* xdg_toplevel.configure, until xdg_surface.configure */
-    bool pending_maximized, pending_fullscreen, pending_tiled;
+    bool pending_maximized, pending_fullscreen, pending_tiled, pending_activated;
     bool configured, maximized, fullscreen, tiled, minimized;
     bool server_decoration;         /* the compositor draws the title bar */
     bool closed;
@@ -190,8 +190,12 @@ typedef struct cui__wl {
     cui__wl_shm_buffer sw_buffers[3];
     bool sw_dropped;                /* a picture was not shown: the compositor held all three buffers */
     bool shown;                     /* cui__plat_show was called: pictures may go to the window */
+    bool unpaced;                   /* cui_app_desc.no_vsync: frames do not wait for the compositor's frame callbacks */
     bool gpu_started, gpu_skipped;  /* Vulkan: a frame was drawn; one was held back while the window was hidden (cui__plat_gpu_frame) */
 } cui__wl;
+
+#define CUI__WL_CLIP_SECONDS 5.0             /* the longest a paste waits for its text */
+#define CUI__WL_CLIP_BYTES (64u << 20)      /* the most text a paste takes */
 
 static const char *const cui__wl_text_mimes[] = { "text/plain;charset=utf-8", "UTF8_STRING", "text/plain" };
 static char cui__wl_error[160];
@@ -552,7 +556,14 @@ static void cui__wl_pointer_leave(void *data, struct wl_pointer *p, uint32_t ser
     cui__wl *w = data;
     w->events++;
     (void)p; (void)serial; (void)surface;
-    if (w->over == CUI__WL_OVER_CONTENT && !cui_mouse_down(w->app->ui, CUI_MOUSE_LEFT)) cui_input_mouse_leave(w->app->ui);
+    if (w->over == CUI__WL_OVER_CONTENT) {
+        /* a pointer that leaves during a press was taken by the compositor (a window move, its
+         * menu): the release goes to it, so the buttons are let go here */
+        static const cui_mouse_button buttons[] = { CUI_MOUSE_LEFT, CUI_MOUSE_RIGHT, CUI_MOUSE_MIDDLE };
+        for (size_t i = 0; i < sizeof buttons / sizeof buttons[0]; i++)
+            if (cui_mouse_down(w->app->ui, buttons[i])) cui_input_mouse_button(w->app->ui, buttons[i], false);
+        cui_input_mouse_leave(w->app->ui);
+    }
     w->over = CUI__WL_OVER_NOTHING;
     w->bar_pressed = 0;
 }
@@ -692,13 +703,36 @@ static void cui__wl_keyboard_leave(void *data, struct wl_keyboard *k, uint32_t s
     cui_input_focus(w->app->ui, false);
 }
 
+/* The key a key code stands for, by its first level, as the X11 backend reads it: Shift+1 is the
+ * 1 key. A layout without Latin letters (Russian, Greek, Hebrew, Arabic) names no key CUI has for
+ * a letter: the key is then what another layout of the keymap calls it, and failing that its
+ * place on the keyboard, so that Ctrl+C is the same key whichever layout is active. */
+static cui_key cui__wl_key_of(cui__wl *w, uint32_t code) {
+    const xkb_keysym_t *syms = NULL;
+    xkb_layout_index_t active = xkb_state_key_get_layout(w->xkb_state, code);
+    int n = xkb_keymap_key_get_syms_by_level(w->keymap, code, active, 0, &syms);
+    cui_key key = n > 0 ? cui__wl_key(syms[0]) : CUI_KEY_NONE;
+    xkb_layout_index_t layouts = xkb_keymap_num_layouts_for_key(w->keymap, code);
+    for (xkb_layout_index_t l = 0; !key && l < layouts; l++) {
+        if (l == active) continue;
+        n = xkb_keymap_key_get_syms_by_level(w->keymap, code, l, 0, &syms);
+        if (n > 0) key = cui__wl_key(syms[0]);
+    }
+    if (!key && code >= 8) {
+        /* evdev key codes of the three letter rows */
+        static const struct { uint32_t first; const char *letters; } rows[] = { { 16, "qwertyuiop" }, { 30, "asdfghjkl" }, { 44, "zxcvbnm" } };
+        uint32_t evdev = code - 8;
+        for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++)
+            if (evdev >= rows[r].first && evdev < rows[r].first + strlen(rows[r].letters))
+                key = (cui_key)(CUI_KEY_A + (rows[r].letters[evdev - rows[r].first] - 'a'));
+    }
+    return key;
+}
+
 /* A key going down or up, or held long enough to repeat. */
 static void cui__wl_key_event(cui__wl *w, uint32_t code, bool down) {
     if (!w->xkb_state) return;
-    const xkb_keysym_t *syms = NULL;
-    /* the key's first level, as the X11 backend reads it: Shift+1 is the 1 key */
-    int n = xkb_keymap_key_get_syms_by_level(w->keymap, code, xkb_state_key_get_layout(w->xkb_state, code), 0, &syms);
-    cui_key key = n > 0 ? cui__wl_key(syms[0]) : CUI_KEY_NONE;
+    cui_key key = cui__wl_key_of(w, code);
     if (key) cui_input_key(w->app->ui, key, down, w->mods);
     if (down && !(w->mods & CUI_MOD_CTRL)) {
         char text[64];
@@ -743,6 +777,7 @@ static void cui__wl_keyboard_repeat_info(void *data, struct wl_keyboard *k, int3
     cui__wl *w = data;
     (void)k;
     w->repeat_rate = rate; w->repeat_delay_ms = delay;
+    if (rate <= 0) w->repeat_key = 0;   /* the compositor repeats nothing: a held key is not waited on */
 }
 
 static const struct wl_keyboard_listener cui__wl_keyboard_listener = {
@@ -772,6 +807,7 @@ static void cui__wl_device_offer(void *data, struct wl_data_device *device, stru
 static void cui__wl_device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *offer) {
     cui__wl *w = data;
     (void)device; (void)serial; (void)surface; (void)x; (void)y;
+    if (w->drag_offer && w->drag_offer != offer) wl_data_offer_destroy(w->drag_offer);
     w->drag_offer = offer;   /* dropped files are not taken yet: the drag is refused by not accepting it */
     if (offer == w->offer) w->offer = NULL;
 }
@@ -784,7 +820,12 @@ static void cui__wl_device_leave(void *data, struct wl_data_device *device) {
 }
 
 static void cui__wl_device_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x, wl_fixed_t y) { (void)data; (void)device; (void)time; (void)x; (void)y; }
-static void cui__wl_device_drop(void *data, struct wl_data_device *device) { (void)data; (void)device; }
+static void cui__wl_device_drop(void *data, struct wl_data_device *device) {
+    cui__wl *w = data;
+    (void)device;
+    if (w->drag_offer) wl_data_offer_destroy(w->drag_offer);   /* no leave follows a drop */
+    w->drag_offer = NULL;
+}
 
 static void cui__wl_device_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
     cui__wl *w = data;
@@ -877,14 +918,17 @@ static const char *cui__wl_get_clip(void *user) {
     wl_data_offer_receive(w->selection, cui__wl_text_mimes[w->selection_mime - 1], fds[1]);
     close(fds[1]);
     wl_display_flush(w->dpy);
-    /* the owner writes the text and closes the pipe; half a second for one that never does */
+    /* the owner writes the text and closes the pipe; half a second for one that has stopped
+     * writing, counted from what came last, and no more than CUI__WL_CLIP_SECONDS or
+     * CUI__WL_CLIP_BYTES in all */
     size_t len = 0, cap = 0;
     char *text = NULL;
-    double start = cui__plat_now();
+    double start = cui__plat_now(), last = start;
     for (;;) {
         struct pollfd pfd = { fds[0], POLLIN, 0 };
-        int left = (int)((0.5 - (cui__plat_now() - start)) * 1000.0);
-        if (left <= 0 || poll(&pfd, 1, left) <= 0) break;
+        double now = cui__plat_now();
+        int left = (int)((0.5 - (now - last)) * 1000.0);
+        if (left <= 0 || now - start > CUI__WL_CLIP_SECONDS || len > CUI__WL_CLIP_BYTES || poll(&pfd, 1, left) <= 0) break;
         if (len + 4096 + 1 > cap) {
             cap = cap ? cap * 2 : 8192;
             char *grown = realloc(text, cap);
@@ -895,6 +939,7 @@ static const char *cui__wl_get_clip(void *user) {
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
         len += (size_t)n;
+        last = cui__plat_now();
     }
     close(fds[0]);
     free(w->clip_read);
@@ -1031,10 +1076,11 @@ static void cui__wl_toplevel_configure(void *data, struct xdg_toplevel *t, int32
     w->events++;
     (void)t;
     w->pending_w = width; w->pending_h = height;
-    w->pending_maximized = w->pending_fullscreen = w->pending_tiled = false;
+    w->pending_maximized = w->pending_fullscreen = w->pending_tiled = w->pending_activated = false;
     const uint32_t *state;
     wl_array_for_each(state, states) {
         if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED) w->pending_maximized = true;
+        else if (*state == XDG_TOPLEVEL_STATE_ACTIVATED) w->pending_activated = true;
         else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) w->pending_fullscreen = true;
         else if (*state >= XDG_TOPLEVEL_STATE_TILED_LEFT && *state <= XDG_TOPLEVEL_STATE_TILED_BOTTOM) w->pending_tiled = true;
     }
@@ -1054,7 +1100,9 @@ static void cui__wl_xdg_surface_configure(void *data, struct xdg_surface *xs, ui
     cui__wl *w = data;
     w->events++;
     w->maximized = w->pending_maximized; w->fullscreen = w->pending_fullscreen; w->tiled = w->pending_tiled;
-    w->minimized = false;   /* a configure comes when the window is shown again */
+    /* a compositor configures a window as it minimizes it too (it is no longer the active one):
+     * the window is back when it is the active one again */
+    if (w->pending_activated) w->minimized = false;
     int bar = cui__wl_bar_height(w);
     bool normal = !w->maximized && !w->fullscreen && !w->tiled;
     if (w->pending_w > 0 && w->pending_h > 0) {
@@ -1074,11 +1122,26 @@ static void cui__wl_xdg_surface_configure(void *data, struct xdg_surface *xs, ui
 
 static const struct xdg_surface_listener cui__wl_xdg_surface_listener = { cui__wl_xdg_surface_configure };
 
+/* The smallest and largest size the compositor may give the window, title bar included. */
+static void cui__wl_bounds(cui__wl *w) {
+    const cui_app_desc *d = &w->app->desc;
+    int bar = cui__wl_bar_height(w);
+    if (d->fixed_size) {
+        xdg_toplevel_set_min_size(w->toplevel, w->width, w->height + bar);
+        xdg_toplevel_set_max_size(w->toplevel, w->width, w->height + bar);
+    } else {
+        xdg_toplevel_set_min_size(w->toplevel, d->min_width, d->min_height + bar);
+    }
+}
+
 static void cui__wl_decoration_configure(void *data, struct zxdg_toplevel_decoration_v1 *d, uint32_t mode) {
     cui__wl *w = data;
     w->events++;
     (void)d;
-    w->server_decoration = mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+    bool server = mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+    bool changed = server != w->server_decoration;
+    w->server_decoration = server;
+    if (changed && w->configured) cui__wl_bounds(w);   /* the title bar came or went: the bounds count it */
 }
 static const struct zxdg_toplevel_decoration_v1_listener cui__wl_decoration_listener = { cui__wl_decoration_configure };
 
@@ -1111,17 +1174,21 @@ static bool cui__wl_pump(cui__wl *w, double timeout, bool for_frame) {
         bool news = for_frame ? !w->frame : w->events != events;
         while (wl_display_prepare_read(w->dpy) != 0)
             if (wl_display_dispatch_pending(w->dpy) < 0) return false;
-        if (wl_display_flush(w->dpy) < 0 && errno != EAGAIN) { wl_display_cancel_read(w->dpy); return false; }
+        bool unsent = false;   /* the socket is full: wait until it takes more, and send the rest next time round */
+        if (wl_display_flush(w->dpy) < 0) {
+            if (errno != EAGAIN) { wl_display_cancel_read(w->dpy); return false; }
+            unsent = true;
+        }
         news = news || (for_frame ? !w->frame : w->events != events);
         double now = cui__plat_now();
         double left = timeout < 0 ? -1 : timeout - (now - start);
         int ms = news || timeout == 0 || (timeout > 0 && left <= 0) ? 0 : timeout < 0 ? -1 : (int)(left * 1000.0 + 0.999);
-        if (w->repeat_key && !news) {   /* a held key repeats without the compositor saying so */
+        if (w->repeat_key && w->repeat_rate > 0 && !news) {   /* a held key repeats without the compositor saying so */
             int until = (int)((w->repeat_at - now) * 1000.0 + 0.999);
             if (until < 0) until = 0;
             if (ms < 0 || until < ms) ms = until;
         }
-        struct pollfd pfd = { wl_display_get_fd(w->dpy), POLLIN, 0 };
+        struct pollfd pfd = { wl_display_get_fd(w->dpy), (short)(POLLIN | (unsent ? POLLOUT : 0)), 0 };
         int ready = poll(&pfd, 1, ms);
         if (ready > 0 && (pfd.revents & POLLIN)) {
             if (wl_display_read_events(w->dpy) < 0) return false;
@@ -1200,7 +1267,7 @@ bool cui__plat_init(cui_app *app) {
     w->app = app;
     cui__wl_error[0] = 0;
     w->dpy = wl_display_connect(NULL);
-    if (!w->dpy) { snprintf(cui__wl_error, sizeof cui__wl_error, "no compositor to connect to"); free(w); return false; }
+    if (!w->dpy) { snprintf(cui__wl_error, sizeof cui__wl_error, "no compositor to connect to"); fprintf(stderr, "cui: wayland: %s\n", cui__wl_error); free(w); return false; }
     w->xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     w->repeat_rate = 25; w->repeat_delay_ms = 400;
     w->registry = wl_display_get_registry(w->dpy);
@@ -1208,7 +1275,7 @@ bool cui__plat_init(cui_app *app) {
     wl_display_roundtrip(w->dpy);   /* the globals */
     wl_display_roundtrip(w->dpy);   /* what they say of themselves: outputs, the seat */
     if (!w->compositor || !w->wm) {
-        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor has no %s", w->compositor ? "xdg_wm_base" : "wl_compositor");
+        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor has no %s", w->compositor ? "xdg_wm_base" : "wl_compositor"); fprintf(stderr, "cui: wayland: %s\n", cui__wl_error);
         cui__wl_destroy(w);
         return false;
     }
@@ -1236,8 +1303,8 @@ bool cui__plat_init(cui_app *app) {
         zxdg_toplevel_decoration_v1_set_mode(w->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
     /* sizes the compositor works with are the whole window's: with the built-in title bar.
-     * Whether there will be one is known after the first configure; these bounds are set
-     * again in cui__plat_show. */
+     * Whether there will be one is known after the first configure, so the bounds are set
+     * then (cui__wl_bounds), and again when the decoration or a fixed window's size changes. */
     const cui_window_placement *pl = app->desc.placement;
     if (pl && pl->state == CUI_WINDOW_MAXIMIZED) xdg_toplevel_set_maximized(w->toplevel);
     if (w->seat && w->data_manager) {
@@ -1248,18 +1315,12 @@ bool cui__plat_init(cui_app *app) {
     for (int i = 0; i < 50 && !w->configured; i++)
         if (wl_display_roundtrip(w->dpy) < 0) break;
     if (!w->configured) {
-        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor did not configure the window");
+        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor did not configure the window"); fprintf(stderr, "cui: wayland: %s\n", cui__wl_error);
         cui__wl_destroy(w);
         app->plat = NULL;
         return false;
     }
-    int bar = cui__wl_bar_height(w);
-    if (app->desc.fixed_size) {
-        xdg_toplevel_set_min_size(w->toplevel, w->width, w->height + bar);
-        xdg_toplevel_set_max_size(w->toplevel, w->width, w->height + bar);
-    } else {
-        xdg_toplevel_set_min_size(w->toplevel, app->desc.min_width, app->desc.min_height + bar);
-    }
+    cui__wl_bounds(w);
     cui_platform_iface pi;
     memset(&pi, 0, sizeof pi);
     pi.user = app;
@@ -1346,7 +1407,7 @@ static bool cui__wl_egl_context(cui__wl *w, bool es) {
 bool cui__plat_gl_create(cui_app *app, bool vsync) {
     cui__wl *w = cui__wl_of(app);
     cui__egl *e = &w->egl;
-    (void)vsync;
+    w->unpaced = !vsync;
     if (!cui__wl_egl_load(e)) return false;
     e->display = e->GetPlatformDisplay ? e->GetPlatformDisplay(EGL_PLATFORM_WAYLAND_, w->dpy, NULL) : NULL;
     if (!e->display) e->display = e->GetDisplay(w->dpy);
@@ -1401,11 +1462,13 @@ bool cui__plat_gpu_frame(cui_app *app) {
     cui__wl *w = cui__wl_of(app);
     if (!w->shown) return false;
     double start = cui__plat_now();
-    while (w->frame && app->running) {
+    bool unpaced = app->desc.no_vsync;   /* drawn as fast as cui_app asks: the swapchain's present mode decides what is shown */
+    while (w->frame && app->running && !unpaced) {
         double left = 0.25 - (cui__plat_now() - start);
         if (left <= 0) break;
         if (!cui__wl_pump(w, left, true)) { app->running = false; return false; }
     }
+    if (w->frame && unpaced) { wl_callback_destroy(w->frame); w->frame = NULL; }
     if (w->frame) { w->gpu_skipped = true; return false; }
     if (w->gpu_started) {   /* (the first frame maps the window: nothing to wait for before it) */
         w->frame = wl_surface_frame(w->surface);
@@ -1423,7 +1486,7 @@ void cui__plat_gl_swap(cui_app *app) {
     /* one frame per refresh: wait until the compositor has shown the last one. A hidden
      * window gets no callback: after a quarter of a second the frame goes out anyway. */
     double start = cui__plat_now();
-    while (w->frame && app->running) {
+    while (w->frame && app->running && !w->unpaced) {
         double left = 0.25 - (cui__plat_now() - start);
         if (left <= 0) break;
         if (!cui__wl_pump(w, left, true)) { app->running = false; return; }
@@ -1495,8 +1558,13 @@ void cui__plat_set_title(cui_app *app, const char *title) {
 void cui__plat_set_size(cui_app *app, int width, int height) {
     cui__wl *w = cui__wl_of(app);
     if (w->maximized || w->fullscreen || w->tiled || width < 1 || height < 1) return;   /* the compositor's size holds */
+    if (!app->desc.fixed_size) {   /* no smaller than the window may be made by hand */
+        if (width < app->desc.min_width) width = app->desc.min_width;
+        if (height < app->desc.min_height) height = app->desc.min_height;
+    }
     w->width = w->normal_w = width;
     w->height = w->normal_h = height;
+    if (app->desc.fixed_size) cui__wl_bounds(w);   /* a fixed window's bounds are its size */
     cui__wl_apply(w);
     if (app->presented_once) wl_surface_commit(w->surface);
 }
@@ -1517,7 +1585,7 @@ void cui__plat_maximize(cui_app *app) { xdg_toplevel_set_maximized(cui__wl_of(ap
 void cui__plat_minimize(cui_app *app) {
     cui__wl *w = cui__wl_of(app);
     xdg_toplevel_set_minimized(w->toplevel);
-    w->minimized = true;   /* Wayland does not say when it ends: taken back at the next configure */
+    w->minimized = true;   /* Wayland does not say when it ends: taken back when the window is active again */
 }
 
 void cui__plat_restore(cui_app *app) {
