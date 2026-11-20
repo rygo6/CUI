@@ -931,6 +931,14 @@ static void cui__vk_copy_out(cui_gpu_renderer *r, cui__vk_frame *f, bool wanted)
         region.imageExtent.height = r->extent.height;
         region.imageExtent.depth = 1;
         vkCmdCopyImageToBuffer(f->cmd, f->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f->readback.buffer, 1, &region);
+        /* waiting for the submission orders the read after the copy, and this makes what the copy wrote the host's to read */
+        VkBufferMemoryBarrier host = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        host.buffer = f->readback.buffer;
+        host.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &host, 0, NULL);
         cui__vk_barrier(r, f->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else {
         cui__vk_barrier(r, f->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
