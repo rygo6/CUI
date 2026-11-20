@@ -196,6 +196,9 @@ typedef struct cui_draw_list {
     cui_vertex *vtx; int vtx_count, vtx_cap;
     uint32_t *idx; int idx_count, idx_cap;
     cui_draw_cmd *cmd; int cmd_count, cmd_cap;
+    cui_instance *inst; int inst_count, inst_cap;
+    bool instanced;        /* quads may be emitted as instances */
+    int vertices_only;     /* >0: a caller edits the vertices it emits, so quads stay vertices */
     cui_rect clip_stack[64]; int clip_depth;
     cui_xform xform_stack[32]; int xform_depth;
     cui_texture cur_tex;

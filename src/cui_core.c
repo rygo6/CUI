@@ -250,6 +250,7 @@ cui_ctx *cui_create(const cui_ctx_desc *desc) {
     ui->settle_frames = 2;
     ui->toast_next_handle = 1;
     cui__theme_init(ui, d.theme, d.accent);
+    ui->dl.instanced = d.instanced_quads;
     cui__fonts_init(ui, !d.no_default_fonts);
     return ui;
 }
@@ -275,6 +276,7 @@ void cui_destroy(cui_ctx *ui) {
     cui__free(ui, ui->dl.vtx);
     cui__free(ui, ui->dl.idx);
     cui__free(ui, ui->dl.cmd);
+    cui__free(ui, ui->dl.inst);
     ui->arena_used = 0;
     cui__frame_arena_reset(ui);
     cui__free(ui, ui->arena);
@@ -1193,6 +1195,8 @@ void cui_end_frame(cui_ctx *ui) {
         ui->component_input.focus_owner = ui->focus == owner ? owner : 0;
         ui->component_input.focus_request = 0;
     }
+    dd->instances = ui->dl.inst;
+    dd->instance_count = ui->dl.inst_count;
     ui->in_frame = false;
 }
 

@@ -85,6 +85,7 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
     memset(&cd, 0, sizeof cd);
     cd.theme = mode;
     cd.accent = d->accent;
+    cd.instanced_quads = d->instanced_quads;
     app->ui = cui_create(&cd);
     if (!app->ui) { free(app); return NULL; }
     if (!cui__plat_init(app)) {

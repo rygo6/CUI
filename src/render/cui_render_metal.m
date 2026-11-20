@@ -116,6 +116,7 @@ static const char cui__mtl_msl[] =
 @end
 
 struct cui_gpu_renderer {
+    cui_expanded expanded;              /* instances written out as vertices: this renderer draws vertices only */
     void *win;                          /* CUIMetalWindow, retained */
     bool readable;                      /* a frame was read back: the drawables stay readable from then on */
 };
@@ -231,6 +232,7 @@ static bool cui__mtl_device(CUIMetalWindow *w) {
 
 void cui_gpu_destroy(cui_gpu_renderer *r) {
     if (!r) return;
+    cui_expanded_free(&r->expanded);
     @autoreleasepool {
         CUIMetalWindow *w = (__bridge_transfer CUIMetalWindow *)r->win;
         for (CUIMetalSlot *s in w.slots) [s.reader waitUntilCompleted];
@@ -407,6 +409,8 @@ static void cui__mtl_read_back(id<MTLBuffer> readback, int fw, int fh, void *rgb
 
 static bool cui__mtl_render(cui_gpu_renderer *r, const cui_draw_data *dd, void *rgba) {
     if (!r || !dd) return false;
+    dd = cui_expand_instances(&r->expanded, dd);
+    if (!dd) return false;
     @autoreleasepool {
         CUIMetalWindow *w = cui__mtl_win(r);
         int fw = dd->width_px, fh = dd->height_px;

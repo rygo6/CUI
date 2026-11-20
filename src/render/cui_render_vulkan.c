@@ -84,6 +84,7 @@ struct cui_gpu_renderer {
     VkDescriptorSetLayout set_layout;
     VkPipelineLayout layout;
     VkPipeline pipeline;
+    VkPipeline instance_pipeline;   /* cui_instance records: a four vertex strip per instance */
     cui__vk_tex *tex;               /* by cui_texture - 1 */
     int tex_count, tex_cap;
     int none;                       /* a black texel, for a command whose texture is gone */
@@ -541,8 +542,11 @@ static VkShaderModule cui__vk_module(cui_gpu_renderer *r, const uint32_t *code, 
     return m;
 }
 
-static bool cui__vk_pipeline(cui_gpu_renderer *r) {
-    VkShaderModule vs = cui__vk_module(r, cui__vk_vs, sizeof cui__vk_vs), fs = cui__vk_module(r, cui__vk_fs, sizeof cui__vk_fs);
+/* One of the two pipelines: vertices as a triangle list, or cui_instance records as strips. */
+static VkPipeline cui__vk_pipeline_of(cui_gpu_renderer *r, bool instanced) {
+    VkPipeline made = VK_NULL_HANDLE;
+    VkShaderModule vs = instanced ? cui__vk_module(r, cui__vk_instance_vs, sizeof cui__vk_instance_vs) : cui__vk_module(r, cui__vk_vs, sizeof cui__vk_vs);
+    VkShaderModule fs = cui__vk_module(r, cui__vk_fs, sizeof cui__vk_fs);
     if (vs && fs) {
         VkPipelineShaderStageCreateInfo stages[2] = {
             { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL },
@@ -560,13 +564,25 @@ static bool cui__vk_pipeline(cui_gpu_renderer *r) {
             { 6, 0, VK_FORMAT_R8G8B8A8_UNORM,      (uint32_t)offsetof(cui_vertex, color) },
             { 7, 0, VK_FORMAT_R8G8B8A8_UNORM,      (uint32_t)offsetof(cui_vertex, border_color) },
         };
+        /* one attribute per group of cui_instance fields, read once per instance */
+        VkVertexInputBindingDescription instance_binding = { 0, sizeof(cui_instance), VK_VERTEX_INPUT_RATE_INSTANCE };
+        VkVertexInputAttributeDescription instance_attrs[] = {
+            { 0, 0, VK_FORMAT_R16G16B16A16_SINT,  (uint32_t)offsetof(cui_instance, x0) },
+            { 1, 0, VK_FORMAT_R16G16B16A16_UNORM, (uint32_t)offsetof(cui_instance, u0) },
+            { 2, 0, VK_FORMAT_R16G16B16A16_UINT,  (uint32_t)offsetof(cui_instance, r_tl) },
+            { 3, 0, VK_FORMAT_R16_UINT,           (uint32_t)offsetof(cui_instance, param) },
+            { 4, 0, VK_FORMAT_R8G8_UINT,          (uint32_t)offsetof(cui_instance, mode) },
+            { 5, 0, VK_FORMAT_R8G8B8A8_UNORM,     (uint32_t)offsetof(cui_instance, color_top) },
+            { 6, 0, VK_FORMAT_R8G8B8A8_UNORM,     (uint32_t)offsetof(cui_instance, color_bottom) },
+            { 7, 0, VK_FORMAT_R8G8B8A8_UNORM,     (uint32_t)offsetof(cui_instance, border_color) },
+        };
         VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
         vi.vertexBindingDescriptionCount = 1;
-        vi.pVertexBindingDescriptions = &binding;
-        vi.vertexAttributeDescriptionCount = (uint32_t)(sizeof attrs / sizeof attrs[0]);
-        vi.pVertexAttributeDescriptions = attrs;
+        vi.pVertexBindingDescriptions = instanced ? &instance_binding : &binding;
+        vi.vertexAttributeDescriptionCount = (uint32_t)(instanced ? sizeof instance_attrs / sizeof instance_attrs[0] : sizeof attrs / sizeof attrs[0]);
+        vi.pVertexAttributeDescriptions = instanced ? instance_attrs : attrs;
         VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        ia.topology = instanced ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
         vp.viewportCount = 1;
         vp.scissorCount = 1;
@@ -610,11 +626,17 @@ static bool cui__vk_pipeline(cui_gpu_renderer *r) {
         info.pColorBlendState = &cb;
         info.pDynamicState = &dyn;
         info.layout = r->layout;
-        vkCreateGraphicsPipelines(r->device, VK_NULL_HANDLE, 1, &info, NULL, &r->pipeline);
+        vkCreateGraphicsPipelines(r->device, VK_NULL_HANDLE, 1, &info, NULL, &made);
     }
     if (vs) vkDestroyShaderModule(r->device, vs, NULL);
     if (fs) vkDestroyShaderModule(r->device, fs, NULL);
-    return r->pipeline != VK_NULL_HANDLE;
+    return made;
+}
+
+static bool cui__vk_pipeline(cui_gpu_renderer *r) {
+    r->pipeline = cui__vk_pipeline_of(r, false);
+    r->instance_pipeline = cui__vk_pipeline_of(r, true);
+    return r->pipeline != VK_NULL_HANDLE && r->instance_pipeline != VK_NULL_HANDLE;
 }
 
 static bool cui__vk_device(cui_gpu_renderer *r) {
@@ -817,6 +839,7 @@ void cui_gpu_destroy(cui_gpu_renderer *r) {
         for (int i = 0; i < r->tex_count; i++) cui__vk_tex_destroy(r, (cui_texture)(i + 1));
         cui__vk_collect(r, true);
         if (r->pipeline) vkDestroyPipeline(dev, r->pipeline, NULL);
+        if (r->instance_pipeline) vkDestroyPipeline(dev, r->instance_pipeline, NULL);
         if (r->layout) vkDestroyPipelineLayout(dev, r->layout, NULL);
         if (r->set_layout) vkDestroyDescriptorSetLayout(dev, r->set_layout, NULL);
         if (r->set_pool) vkDestroyDescriptorPool(dev, r->set_pool, NULL);
@@ -916,7 +939,12 @@ static bool cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
     size_t vat = 0, iat = 0;
     uint8_t *v = dd->index_count ? cui__vk_upload(r, vbytes, 16, &vbuf, &vat) : NULL;
     uint8_t *ix = v ? cui__vk_upload(r, ibytes, 16, &ibuf, &iat) : NULL;   /* (a buffer outgrown between the two lives until this frame has run) */
-    bool drawn = !dd->index_count || (v && ix);
+    /* and its cui_instance records, drawn by the instance pipeline */
+    size_t nbytes = sizeof(cui_instance) * (size_t)(dd->instance_count > 0 ? dd->instance_count : 0);
+    VkBuffer nbuf = VK_NULL_HANDLE;
+    size_t nat = 0;
+    uint8_t *n = nbytes ? cui__vk_upload(r, nbytes, 16, &nbuf, &nat) : NULL;
+    bool drawn = (!dd->index_count || (v && ix)) && (!nbytes || n);
 
     cui__vk_barrier(r, f->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo color = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
@@ -934,22 +962,22 @@ static bool cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color;
     vkCmdBeginRendering(cmd, &rendering);
-    if (v && ix) {
-        memcpy(v, dd->vertices, vbytes);
-        memcpy(ix, dd->indices, ibytes);
+    bool indexed = v && ix;
+    if (indexed || n) {
+        if (indexed) { memcpy(v, dd->vertices, vbytes); memcpy(ix, dd->indices, ibytes); }
+        if (n) memcpy(n, dd->instances, nbytes);
         int W = (int)r->extent.width, H = (int)r->extent.height;
         VkViewport vp = { 0, 0, (float)dd->width_px, (float)dd->height_px, 0, 1 };
         float viewport[2] = { (float)dd->width_px, (float)dd->height_px };
-        VkDeviceSize voffset = vat;
+        VkDeviceSize voffset = vat, noffset = nat;
         vkCmdSetViewport(cmd, 0, 1, &vp);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipeline);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voffset);
-        vkCmdBindIndexBuffer(cmd, ibuf, iat, VK_INDEX_TYPE_UINT32);
-        vkCmdPushConstants(cmd, r->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof viewport, viewport);
+        if (indexed) vkCmdBindIndexBuffer(cmd, ibuf, iat, VK_INDEX_TYPE_UINT32);
+        int kind = -1;   /* 0: the vertex pipeline is bound, 1: the instance pipeline */
         int bound = -1;
         for (int i = 0; i < dd->command_count; i++) {
             const cui_draw_cmd *c = &dd->commands[i];
-            if (!c->index_count) continue;
+            int want = c->instance_count ? 1 : 0;
+            if (want ? !n : (!indexed || !c->index_count)) continue;
             int x0 = (int)floorf(c->clip.x), y0 = (int)floorf(c->clip.y);
             int x1 = (int)ceilf(c->clip.x + c->clip.w), y1 = (int)ceilf(c->clip.y + c->clip.h);
             if (x0 < 0) x0 = 0;
@@ -957,6 +985,13 @@ static bool cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
             if (x1 > W) x1 = W;
             if (y1 > H) y1 = H;
             if (x1 <= x0 || y1 <= y0) continue;
+            if (want != kind) {
+                /* both pipelines share the layout, so the texture binding carries over; the push constants are set again */
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want ? r->instance_pipeline : r->pipeline);
+                vkCmdBindVertexBuffers(cmd, 0, 1, want ? &nbuf : &vbuf, want ? &noffset : &voffset);
+                vkCmdPushConstants(cmd, r->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof viewport, viewport);
+                kind = want;
+            }
             VkRect2D sc = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
             vkCmdSetScissor(cmd, 0, 1, &sc);
             cui_texture t = c->texture ? c->texture : dd->font_atlas;
@@ -966,11 +1001,12 @@ static bool cui__vk_draw(cui_gpu_renderer *r, const cui__vk_frame *f, const cui_
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, 1, &r->tex[slot].set, 0, NULL);
                 bound = slot;
             }
-            vkCmdDrawIndexed(cmd, (uint32_t)c->index_count, 1, (uint32_t)c->index_offset, 0, 0);
+            if (want) vkCmdDraw(cmd, 4, c->instance_count, 0, c->instance_offset);   /* the first instance picks the first record */
+            else vkCmdDrawIndexed(cmd, (uint32_t)c->index_count, 1, (uint32_t)c->index_offset, 0, 0);
         }
     }
     vkCmdEndRendering(cmd);
-    return drawn;   /* false: the vertices found no room, and only the cleared window is shown */
+    return drawn;   /* false: the vertices or the records found no room, and what did is all that is shown */
 }
 
 /* The frame copied out, if asked, and the image made ready to present. */

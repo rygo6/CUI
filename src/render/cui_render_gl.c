@@ -23,6 +23,11 @@ typedef ptrdiff_t GLintptr_;
 typedef unsigned int GLbitfield_;
 
 #define GL_TRIANGLES_ 0x0004
+#define GL_TRIANGLE_STRIP_ 0x0005
+#define GL_RGBA32UI_ 0x8D70
+#define GL_RGBA_INTEGER_ 0x8D99
+#define GL_NEAREST_ 0x2600
+#define GL_TEXTURE1_ 0x84C1
 #define GL_UNSIGNED_INT_ 0x1405
 #define GL_UNSIGNED_BYTE_ 0x1401
 #define GL_FLOAT_ 0x1406
@@ -104,12 +109,17 @@ typedef struct {
     void (CUI_GLAPI *BindAttribLocation)(GLuint_, GLuint_, const GLchar_ *);
     void (CUI_GLAPI *ReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void *);
     void (CUI_GLAPI *Finish)(void);
+    void (CUI_GLAPI *DrawArraysInstanced)(GLenum_, GLint_, GLsizei_, GLsizei_);
 } cui__gl_fns;
 
 struct cui_gl_renderer {
     cui__gl_fns gl;
     GLuint_ program, vao, vbo, ebo;
     GLint_ u_viewport, u_tex;
+    /* cui_instance records: uploaded whole as a texture of 32 bit words that the vertex shader indexes */
+    GLuint_ inst_program, inst_vao, inst_tex;
+    GLint_ inst_u_viewport, inst_u_tex, inst_u_records, inst_u_first;
+    int inst_rows;
     bool es;
     bool software;   /* the driver draws on the CPU (llvmpipe, SwiftShader, ...) */
     struct { GLuint_ id; cui_texture_format fmt; int w, h; } *tex;
@@ -137,6 +147,58 @@ static const char *cui__vs_src =
     "  v_uv = a_uv; v_local = a_local; v_half = a_half; v_radii = a_radii;\n"
     "  v_params = a_params; v_color = a_color; v_bcolor = a_bcolor;\n"
     "  gl_Position = vec4(a_pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - a_pos.y / u_viewport.y * 2.0, 0.0, 1.0);\n"
+    "}\n";
+
+/* The record texture holds four 32 bit words in a texel, so one cui_instance is two and a half
+ * texels. A row is a whole number of records, and no record is split between two rows. */
+#define CUI__INST_WORDS 10
+#define CUI__INST_ROW_TEXELS 255
+#define CUI__INST_ROW_WORDS (CUI__INST_ROW_TEXELS * 4)
+
+/* Builds one corner of a quad from its cui_instance. A quad is one instance of a four vertex strip;
+ * the record is u_first + gl_InstanceID, read from the record texture with three fetches. Works as
+ * GLSL 3.30 and GLSL ES 3.00 (OpenGL ES 3.0, WebGL 2). Its outputs are the fragment shader's inputs. */
+static const char *cui__inst_vs_src =
+    "uniform highp usampler2D u_records;\n"
+    "uniform int u_first;\n"
+    "uniform vec2 u_viewport;\n"
+    "out vec2 v_uv;\n"
+    "out vec2 v_local;\n"
+    "flat out vec2 v_half;\n"
+    "flat out vec4 v_radii;\n"
+    "flat out vec2 v_params;\n"
+    "out vec4 v_color;\n"
+    "flat out vec4 v_bcolor;\n"
+    "uvec4 texel(int t) { return texelFetch(u_records, ivec2(t % 255, t / 255), 0); }\n"
+    "float lo16(uint w) { return float(w & 65535u); }\n"
+    "float hi16(uint w) { return float(w >> 16); }\n"
+    "float signed16(float v) { return v >= 32768.0 ? v - 65536.0 : v; }\n"
+    "vec4 rgba(uint w) { return vec4(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u), float(w >> 24)) / 255.0; }\n"
+    "void main() {\n"
+    "  int word = (u_first + gl_InstanceID) * 10;\n"
+    "  int t = word / 4;\n"
+    "  uvec4 a = texel(t), b = texel(t + 1), c = texel(t + 2);\n"
+    "  bool even = word == t * 4;\n"
+    "  uvec4 p = even ? a : uvec4(a.zw, b.xy);\n"          /* bounds, texture rect */
+    "  uvec4 q = even ? b : uvec4(b.zw, c.xy);\n"          /* radii, param and mode, top color */
+    "  uvec2 r = even ? c.xy : c.zw;\n"                    /* bottom color, border color */
+    "  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+    "  vec2 lo = vec2(signed16(lo16(p.x)), signed16(hi16(p.x))) * 0.25;\n"
+    "  vec2 hi = vec2(signed16(lo16(p.y)), signed16(hi16(p.y))) * 0.25;\n"
+    "  vec2 uv0 = vec2(lo16(p.z), hi16(p.z)) / 65535.0, uv1 = vec2(lo16(p.w), hi16(p.w)) / 65535.0;\n"
+    "  vec2 center = (lo + hi) * 0.5, half_size = (hi - lo) * 0.5;\n"
+    "  float param = lo16(q.z) * 0.25;\n"
+    "  int mode = int((q.z >> 16) & 255u);\n"
+    "  float pad = mode == 2 ? param * 3.0 : ((mode == 1 || mode == 3) ? 1.0 : 0.0);\n"
+    "  vec2 pos = mix(lo - pad, hi + pad, corner);\n"
+    "  v_local = pos - center;\n"
+    "  v_half = half_size;\n"
+    "  v_uv = uv0 + (v_local + half_size) / (2.0 * half_size) * (uv1 - uv0);\n"
+    "  v_radii = vec4(lo16(q.x), hi16(q.x), lo16(q.y), hi16(q.y)) * 0.25;\n"
+    "  v_params = vec2(param, float(mode));\n"
+    "  v_color = mix(rgba(q.w), rgba(r.x), corner.y);\n"
+    "  v_bcolor = rgba(r.y);\n"
+    "  gl_Position = vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0);\n"
     "}\n";
 
 static const char *cui__fs_src =
@@ -232,6 +294,7 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
     CUI__LOAD(LinkProgram); CUI__LOAD(GetProgramiv); CUI__LOAD(GetProgramInfoLog); CUI__LOAD(DeleteProgram);
     CUI__LOAD(UseProgram); CUI__LOAD(GetUniformLocation); CUI__LOAD(Uniform1i); CUI__LOAD(Uniform2f);
     CUI__LOAD(BindAttribLocation); CUI__LOAD(ReadPixels); CUI__LOAD(Finish);
+    CUI__LOAD(DrawArraysInstanced);
     if (missing) {
         fprintf(stderr, "cui: OpenGL function %s not available\n", missing);
         free(r);
@@ -262,6 +325,23 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
     for (int i = 0; i < 8; i++) r->gl.BindAttribLocation(r->program, (GLuint_)i, attrs[i]);
     r->gl.LinkProgram(r->program);
     r->gl.DeleteShader(vs);
+    GLuint_ ivs = cui__gl_shader(r, GL_VERTEX_SHADER_, cui__inst_vs_src);
+    if (ivs) {
+        r->inst_program = r->gl.CreateProgram();
+        r->gl.AttachShader(r->inst_program, ivs);
+        r->gl.AttachShader(r->inst_program, fs);
+        r->gl.LinkProgram(r->inst_program);
+        r->gl.DeleteShader(ivs);
+        GLint_ linked = 0;
+        r->gl.GetProgramiv(r->inst_program, GL_LINK_STATUS_, &linked);
+        if (!linked) {
+            char log[1024];
+            r->gl.GetProgramInfoLog(r->inst_program, sizeof log, NULL, log);
+            fprintf(stderr, "cui: instance program link failed: %s\n", log);
+            r->gl.DeleteProgram(r->inst_program);
+            r->inst_program = 0;
+        }
+    }
     r->gl.DeleteShader(fs);
     GLint_ ok = 0;
     r->gl.GetProgramiv(r->program, GL_LINK_STATUS_, &ok);
@@ -293,6 +373,19 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
     CUI__ATTR(6, 4, GL_UNSIGNED_BYTE_, 1, color);
     CUI__ATTR(7, 4, GL_UNSIGNED_BYTE_, 1, border_color);
 #undef CUI__ATTR
+    if (r->inst_program) {
+        r->inst_u_viewport = r->gl.GetUniformLocation(r->inst_program, "u_viewport");
+        r->inst_u_tex = r->gl.GetUniformLocation(r->inst_program, "u_tex");
+        r->inst_u_records = r->gl.GetUniformLocation(r->inst_program, "u_records");
+        r->inst_u_first = r->gl.GetUniformLocation(r->inst_program, "u_first");
+        r->gl.GenVertexArrays(1, &r->inst_vao);   /* no arrays: the shader reads the record texture */
+        r->gl.GenTextures(1, &r->inst_tex);
+        r->gl.BindTexture(GL_TEXTURE_2D_, r->inst_tex);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+    }
     r->gl.BindVertexArray(0);
     return r;
 }
@@ -305,6 +398,11 @@ void cui_gl_destroy(cui_gl_renderer *r) {
     r->gl.DeleteBuffers(1, &r->ebo);
     r->gl.DeleteVertexArrays(1, &r->vao);
     r->gl.DeleteProgram(r->program);
+    if (r->inst_program) {
+        r->gl.DeleteTextures(1, &r->inst_tex);
+        r->gl.DeleteVertexArrays(1, &r->inst_vao);
+        r->gl.DeleteProgram(r->inst_program);
+    }
     free(r);
 }
 
@@ -379,7 +477,8 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
         r->gl.ClearColor(dd->clear_color.r / 255.0f, dd->clear_color.g / 255.0f, dd->clear_color.b / 255.0f, 1.0f);
         r->gl.Clear(GL_COLOR_BUFFER_BIT_);
     }
-    if (dd->index_count == 0) return;
+    bool instances = dd->instance_count > 0 && r->inst_program;
+    if (dd->index_count == 0 && !instances) return;
     r->gl.Enable(GL_BLEND_);
     r->gl.BlendEquation(GL_FUNC_ADD_);
     r->gl.BlendFunc(GL_ONE_, GL_ONE_MINUS_SRC_ALPHA_);
@@ -395,10 +494,46 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
     r->gl.BufferData(GL_ARRAY_BUFFER_, (GLsizeiptr_)(sizeof(cui_vertex) * (size_t)dd->vertex_count), dd->vertices, GL_STREAM_DRAW_);
     r->gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER_, r->ebo);
     r->gl.BufferData(GL_ELEMENT_ARRAY_BUFFER_, (GLsizeiptr_)(sizeof(uint32_t) * (size_t)dd->index_count), dd->indices, GL_STREAM_DRAW_);
+    if (instances) {
+        r->gl.UseProgram(r->inst_program);
+        r->gl.Uniform2f(r->inst_u_viewport, (float)W, (float)H);
+        r->gl.Uniform1i(r->inst_u_tex, 0);
+        r->gl.Uniform1i(r->inst_u_records, 1);
+        r->gl.BindVertexArray(r->inst_vao);
+        /* the records go up as they are: whole rows in one piece, then the whole texels of the last
+         * row, then its last two words in a texel of their own when the record count is odd */
+        int words = dd->instance_count * CUI__INST_WORDS;
+        int rows = (words + CUI__INST_ROW_WORDS - 1) / CUI__INST_ROW_WORDS, whole = words / CUI__INST_ROW_WORDS;
+        int rest = words - whole * CUI__INST_ROW_WORDS, rest_texels = rest / 4;
+        const uint32_t *data = (const uint32_t *)(const void *)dd->instances;
+        const uint32_t *last = data + (size_t)whole * CUI__INST_ROW_WORDS;
+        r->gl.ActiveTexture(GL_TEXTURE1_);
+        r->gl.BindTexture(GL_TEXTURE_2D_, r->inst_tex);
+        r->gl.PixelStorei(GL_UNPACK_ALIGNMENT_, 4);
+        r->gl.PixelStorei(GL_UNPACK_ROW_LENGTH_, 0);
+        if (rows > r->inst_rows) {
+            r->inst_rows = rows * 2;
+            r->gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA32UI_, CUI__INST_ROW_TEXELS, r->inst_rows, 0, GL_RGBA_INTEGER_, GL_UNSIGNED_INT_, NULL);
+        }
+        if (whole) r->gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, CUI__INST_ROW_TEXELS, whole, GL_RGBA_INTEGER_, GL_UNSIGNED_INT_, data);
+        if (rest_texels) r->gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, whole, rest_texels, 1, GL_RGBA_INTEGER_, GL_UNSIGNED_INT_, last);
+        if (rest & 3) {
+            uint32_t half[4] = { last[rest_texels * 4], last[rest_texels * 4 + 1], 0, 0 };
+            r->gl.TexSubImage2D(GL_TEXTURE_2D_, 0, rest_texels, whole, 1, 1, GL_RGBA_INTEGER_, GL_UNSIGNED_INT_, half);
+        }
+        r->gl.ActiveTexture(GL_TEXTURE0_);
+    }
+    bool instanced_bound = instances;
     GLuint_ bound = (GLuint_)-1;
     for (int i = 0; i < dd->command_count; i++) {
         const cui_draw_cmd *c = &dd->commands[i];
-        if (!c->index_count) continue;
+        bool by_instance = instances && c->instance_count > 0;
+        if (!c->index_count && !by_instance) continue;
+        if (by_instance != instanced_bound) {
+            r->gl.UseProgram(by_instance ? r->inst_program : r->program);
+            r->gl.BindVertexArray(by_instance ? r->inst_vao : r->vao);
+            instanced_bound = by_instance;
+        }
         int x0 = (int)floorf(c->clip.x), y0 = (int)floorf(c->clip.y);
         int x1 = (int)ceilf(c->clip.x + c->clip.w), y1 = (int)ceilf(c->clip.y + c->clip.h);
         if (x1 <= x0 || y1 <= y0) continue;
@@ -407,7 +542,12 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
         int slot = (int)t - 1;
         GLuint_ tid = (slot >= 0 && slot < r->tex_count) ? r->tex[slot].id : 0;
         if (tid != bound) { r->gl.BindTexture(GL_TEXTURE_2D_, tid); bound = tid; }
-        r->gl.DrawElements(GL_TRIANGLES_, (GLsizei_)c->index_count, GL_UNSIGNED_INT_, (const void *)(uintptr_t)(c->index_offset * sizeof(uint32_t)));
+        if (by_instance) {
+            r->gl.Uniform1i(r->inst_u_first, (GLint_)c->instance_offset);
+            r->gl.DrawArraysInstanced(GL_TRIANGLE_STRIP_, 0, 4, (GLsizei_)c->instance_count);
+        } else {
+            r->gl.DrawElements(GL_TRIANGLES_, (GLsizei_)c->index_count, GL_UNSIGNED_INT_, (const void *)(uintptr_t)(c->index_offset * sizeof(uint32_t)));
+        }
     }
     r->gl.Disable(GL_SCISSOR_TEST_);
     r->gl.BindVertexArray(0);
