@@ -28,6 +28,11 @@ typedef unsigned int GLbitfield_;
 #define GL_RGBA_INTEGER_ 0x8D99
 #define GL_NEAREST_ 0x2600
 #define GL_TEXTURE1_ 0x84C1
+#define GL_FRAMEBUFFER_ 0x8D40
+#define GL_READ_FRAMEBUFFER_ 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_ 0x8CA9
+#define GL_DRAW_FRAMEBUFFER_BINDING_ 0x8CA6
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
 #define GL_UNSIGNED_INT_ 0x1405
 #define GL_UNSIGNED_BYTE_ 0x1401
 #define GL_FLOAT_ 0x1406
@@ -110,6 +115,12 @@ typedef struct {
     void (CUI_GLAPI *ReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void *);
     void (CUI_GLAPI *Finish)(void);
     void (CUI_GLAPI *DrawArraysInstanced)(GLenum_, GLint_, GLsizei_, GLsizei_);
+    void (CUI_GLAPI *GetIntegerv)(GLenum_, GLint_ *);
+    void (CUI_GLAPI *GenFramebuffers)(GLsizei_, GLuint_ *);
+    void (CUI_GLAPI *DeleteFramebuffers)(GLsizei_, const GLuint_ *);
+    void (CUI_GLAPI *BindFramebuffer)(GLenum_, GLuint_);
+    void (CUI_GLAPI *FramebufferTexture2D)(GLenum_, GLenum_, GLenum_, GLuint_, GLint_);
+    void (CUI_GLAPI *BlitFramebuffer)(GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLbitfield_, GLenum_);
 } cui__gl_fns;
 
 struct cui_gl_renderer {
@@ -120,6 +131,14 @@ struct cui_gl_renderer {
     GLuint_ inst_program, inst_vao, inst_tex;
     GLint_ inst_u_viewport, inst_u_tex, inst_u_records, inst_u_first;
     int inst_rows;
+    /* cui_gl_render_damaged: the window as drawn so far, which only the damaged part of is drawn into */
+    GLuint_ kept_fbo, kept_tex;
+    int kept_w, kept_h;
+    /* CUI_DAMAGE_CHECK=1: every partly drawn frame is drawn whole as well and the two compared */
+    bool check;
+    uint8_t *check_px;
+    size_t check_cap;
+    unsigned long check_frames, check_wrong;
     bool es;
     bool software;   /* the driver draws on the CPU (llvmpipe, SwiftShader, ...) */
     struct { GLuint_ id; cui_texture_format fmt; int w, h; } *tex;
@@ -295,6 +314,8 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
     CUI__LOAD(UseProgram); CUI__LOAD(GetUniformLocation); CUI__LOAD(Uniform1i); CUI__LOAD(Uniform2f);
     CUI__LOAD(BindAttribLocation); CUI__LOAD(ReadPixels); CUI__LOAD(Finish);
     CUI__LOAD(DrawArraysInstanced);
+    CUI__LOAD(GetIntegerv); CUI__LOAD(GenFramebuffers); CUI__LOAD(DeleteFramebuffers); CUI__LOAD(BindFramebuffer);
+    CUI__LOAD(FramebufferTexture2D); CUI__LOAD(BlitFramebuffer);
     if (missing) {
         fprintf(stderr, "cui: OpenGL function %s not available\n", missing);
         free(r);
@@ -307,6 +328,7 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
         for (size_t i = 0; i < sizeof soft / sizeof *soft; i++) if (strstr(rend, soft[i])) r->software = true;
     }
     r->es = ver && strstr(ver, "OpenGL ES") != NULL;
+    r->check = getenv("CUI_DAMAGE_CHECK") != NULL;
     if (ver && !r->es) {
         int major = 0, minor = 0;
         if (sscanf(ver, "%d.%d", &major, &minor) == 2 && (major < 3 || (major == 3 && minor < 3))) {
@@ -398,6 +420,9 @@ void cui_gl_destroy(cui_gl_renderer *r) {
     r->gl.DeleteBuffers(1, &r->ebo);
     r->gl.DeleteVertexArrays(1, &r->vao);
     r->gl.DeleteProgram(r->program);
+    if (r->kept_fbo) { r->gl.DeleteFramebuffers(1, &r->kept_fbo); r->gl.DeleteTextures(1, &r->kept_tex); }
+    if (r->check) fprintf(stderr, "cui: damage check: %lu of %lu partly drawn frames differ from the whole frame\n", r->check_wrong, r->check_frames);
+    free(r->check_px);
     if (r->inst_program) {
         r->gl.DeleteTextures(1, &r->inst_tex);
         r->gl.DeleteVertexArrays(1, &r->inst_vao);
@@ -552,6 +577,82 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
     r->gl.Disable(GL_SCISSOR_TEST_);
     r->gl.BindVertexArray(0);
     r->gl.UseProgram(0);
+}
+
+/* The kept image as it was drawn in part, against the same frame drawn whole into it. */
+static void cui__gl_check_damage(cui_gl_renderer *r, const cui_draw_data *dd) {
+    int W = dd->width_px, H = dd->height_px;
+    size_t bytes = (size_t)W * (size_t)H * 4;
+    if (bytes * 2 > r->check_cap) {
+        uint8_t *p = realloc(r->check_px, bytes * 2);
+        if (!p) return;
+        r->check_px = p;
+        r->check_cap = bytes * 2;
+    }
+    cui_gl_read_pixels(r, W, H, r->check_px);
+    cui_gl_render(r, dd, true);
+    cui_gl_read_pixels(r, W, H, r->check_px + bytes);
+    unsigned long wrong = 0;
+    int x0 = W, y0 = H, x1 = 0, y1 = 0;
+    for (size_t i = 0; i < bytes; i++) {
+        int delta = (int)r->check_px[i] - (int)r->check_px[bytes + i];
+        if (delta >= -2 && delta <= 2) continue;   /* (a level or two: the same blend, rounded) */
+        int x = (int)(i / 4 % (size_t)W), y = (int)(i / 4 / (size_t)W);
+        x0 = CUI_MIN(x0, x); y0 = CUI_MIN(y0, y); x1 = CUI_MAX(x1, x + 1); y1 = CUI_MAX(y1, y + 1);
+        wrong++;
+    }
+    r->check_frames++;
+    if (!wrong) return;
+    if (r->check_wrong++ < 10) fprintf(stderr, "cui: damage check: %lu bytes differ inside %d,%d to %d,%d of %dx%d\n", wrong, x0, y0, x1, y1, W, H);
+}
+
+bool cui_gl_render_damaged(cui_gl_renderer *r, const cui_draw_data *dd, cui_damage *d, bool present_anyway) {
+    if (!r || !dd || !d) return false;
+    int W = dd->width_px, H = dd->height_px;
+    if (W <= 0 || H <= 0) return false;
+    GLint_ target = 0;   /* the window's framebuffer: not always 0 */
+    r->gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_, &target);
+    if (r->kept_w != W || r->kept_h != H) {
+        if (r->kept_fbo) { r->gl.DeleteFramebuffers(1, &r->kept_fbo); r->gl.DeleteTextures(1, &r->kept_tex); }
+        r->gl.GenTextures(1, &r->kept_tex);
+        r->gl.BindTexture(GL_TEXTURE_2D_, r->kept_tex);
+        r->gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, W, H, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, NULL);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+        r->gl.GenFramebuffers(1, &r->kept_fbo);
+        r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept_fbo);
+        r->gl.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, r->kept_tex, 0);
+        r->kept_w = W; r->kept_h = H;
+        cui_damage_reset(d);   /* the new image holds nothing yet */
+    }
+    cui_rect rect;
+    bool full = false;
+    bool changed = cui_damage_track(d, dd, &rect, &full);
+    if (!changed && !present_anyway) {
+        r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target);
+        return false;
+    }
+    if (changed) {
+        r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept_fbo);
+        if (full) {
+            cui_gl_render(r, dd, true);
+        } else {
+            r->gl.Viewport(0, 0, W, H);
+            r->gl.Enable(GL_SCISSOR_TEST_);
+            r->gl.Scissor((GLint_)rect.x, H - (GLint_)(rect.y + rect.h), (GLsizei_)rect.w, (GLsizei_)rect.h);
+            r->gl.ClearColor(dd->clear_color.r / 255.0f, dd->clear_color.g / 255.0f, dd->clear_color.b / 255.0f, 1.0f);
+            r->gl.Clear(GL_COLOR_BUFFER_BIT_);
+            r->gl.Disable(GL_SCISSOR_TEST_);
+            cui_gl_render(r, cui_damage_clip(d, dd, rect), false);
+            if (r->check) cui__gl_check_damage(r, dd);
+        }
+    }
+    r->gl.BindFramebuffer(GL_READ_FRAMEBUFFER_, r->kept_fbo);
+    r->gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, (GLuint_)target);
+    r->gl.Disable(GL_SCISSOR_TEST_);
+    r->gl.BlitFramebuffer(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT_, GL_NEAREST_);
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target);
+    return true;
 }
 
 void cui_gl_read_pixels(cui_gl_renderer *r, int w, int h, void *rgba) {

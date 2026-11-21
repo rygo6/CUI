@@ -33,6 +33,7 @@ extern "C" {
 #endif
 
 typedef struct cui_app cui_app;
+struct cui_damage_stats;   /* cui_render.h */
 
 typedef enum cui_renderer_kind {
     CUI_RENDERER_AUTO = 0,     /* OpenGL, or software when there is no GPU (CPU-drawn OpenGL, X11 and Win32) */
@@ -71,6 +72,10 @@ typedef struct cui_app_desc {
     bool no_vsync;              /* OpenGL: do not wait for the display; frames are capped at 120 Hz or the refresh rate */
     bool hidden;                /* create the window hidden (tests) */
     bool instanced_quads;       /* cui_ctx_desc.instanced_quads: compact shape records in the draw data; CUI_INSTANCED=1 sets it too */
+    /* OpenGL: draw and present only what changed since the last frame, and nothing when nothing
+     * did (cui_gl_render_damaged). Turns instanced_quads on, which it compares. CUI_DAMAGE=1 sets
+     * it too; CUI_DAMAGE_STATS=1 prints what was drawn when the app closes. */
+    bool damage_tracking;
     cui_renderer_kind renderer;
     cui_theme_mode theme;
     cui_accent accent;
@@ -99,6 +104,9 @@ CUI_API void cui_app_destroy(cui_app *app);
  * called. */
 CUI_API bool cui_app_frame(cui_app *app);
 CUI_API cui_ctx *cui_app_ui(cui_app *app);
+/* What damage tracking has drawn so far (cui_app_desc.damage_tracking). False, and out left
+ * alone, when the app does not track damage: it is off, or the renderer is not OpenGL. */
+CUI_API bool cui_app_damage_stats(cui_app *app, struct cui_damage_stats *out);
 
 /* Creates the app, calls frame() until the window closes, destroys it. */
 CUI_API int cui_app_run(const cui_app_desc *desc, void (*frame)(cui_ctx *ui, void *user), void *user);

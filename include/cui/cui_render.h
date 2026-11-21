@@ -52,6 +52,33 @@ CUI_API bool cui_sw_last_damage(const cui_sw_renderer *r, int *x, int *y, int *w
 /* Writes a PNG file (RGBA pixels). Returns false on failure. */
 CUI_API bool cui_write_png(const char *path, const void *rgba, int width, int height, int stride);
 
+/* ---- Damage ---- */
+
+/* What one frame's draw data changes against the frame before, so that only that rectangle is
+ * drawn again. Works on the cui_instance records of cui_ctx_desc.instanced_quads; draw data
+ * that is all vertices damages the whole of what its commands can draw in. See cui_damage.c. */
+typedef struct cui_damage cui_damage;
+typedef struct cui_damage_stats {
+    uint64_t frames;      /* cui_damage_track calls */
+    uint64_t unchanged;   /* nothing changed: nothing to draw or present */
+    uint64_t partial;     /* a rectangle changed */
+    uint64_t full;        /* the whole window is to be drawn */
+    uint64_t pixels;      /* the pixels of the partial and full frames' rectangles, added up */
+} cui_damage_stats;
+
+CUI_API cui_damage *cui_damage_create(void);
+CUI_API void cui_damage_destroy(cui_damage *d);
+/* Compares dd with the draw data of the last call and remembers dd. False when nothing changed.
+ * Otherwise rect is the changed rectangle in pixels (top-left origin), and *full says the whole
+ * window is to be drawn: the first frame, another size or clear color, or most of it changed. */
+CUI_API bool cui_damage_track(cui_damage *d, const cui_draw_data *dd, cui_rect *rect, bool *full);
+/* dd with only the commands and records that touch rect, their clips cut to it. Valid until
+ * the next call with d. */
+CUI_API const cui_draw_data *cui_damage_clip(cui_damage *d, const cui_draw_data *dd, cui_rect rect);
+/* The next cui_damage_track is a full one: the picture drawn so far was lost. */
+CUI_API void cui_damage_reset(cui_damage *d);
+CUI_API cui_damage_stats cui_damage_get_stats(const cui_damage *d);
+
 /* ---- Instances as vertices ---- */
 
 /* For a renderer that draws vertices only: draw data whose cui_instance records
@@ -86,6 +113,12 @@ CUI_API cui_renderer_iface cui_gl_iface(cui_gl_renderer *r);
 CUI_API void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear);
 /* Reads the bound framebuffer into a top-down RGBA buffer. */
 CUI_API void cui_gl_read_pixels(cui_gl_renderer *r, int width, int height, void *rgba);
+/* cui_gl_render for the part of the window that changed since the last call: the renderer keeps
+ * an image of the window, draws only the damaged rectangle into it (the whole of it when d says
+ * so) and copies the image to the framebuffer that is bound. False when nothing changed and
+ * nothing was drawn or copied, so there is nothing to swap; present_anyway copies the image even
+ * then (the window was exposed). d is the caller's, one per window. */
+CUI_API bool cui_gl_render_damaged(cui_gl_renderer *r, const cui_draw_data *dd, struct cui_damage *d, bool present_anyway);
 /* True when the OpenGL driver draws on the CPU (Mesa llvmpipe, SwiftShader and the
  * like, as in virtual machines and remote sessions). CUI's own software renderer,
  * which redraws only what changed, is then much cheaper. */

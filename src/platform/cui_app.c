@@ -85,7 +85,8 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
     memset(&cd, 0, sizeof cd);
     cd.theme = mode;
     cd.accent = d->accent;
-    cd.instanced_quads = d->instanced_quads || cui__env_is("CUI_INSTANCED", "1");
+    d->damage_tracking = d->damage_tracking || cui__env_is("CUI_DAMAGE", "1");
+    cd.instanced_quads = d->damage_tracking || d->instanced_quads || cui__env_is("CUI_INSTANCED", "1");
     app->ui = cui_create(&cd);
     if (!app->ui) { free(app); return NULL; }
     if (!cui__plat_init(app)) {
@@ -164,6 +165,15 @@ void cui_app_destroy(cui_app *app) {
     cui_set_renderer(app->ui, NULL);
     if (app->gl) cui_gl_destroy(app->gl);
     app->gl = NULL;
+    if (app->damage && cui__env_is("CUI_DAMAGE_STATS", "1")) {
+        cui_damage_stats st = cui_damage_get_stats(app->damage);
+        uint64_t drawn = st.partial + st.full;
+        fprintf(stderr, "cui: damage: %llu frames, %llu unchanged, %llu partial, %llu full, %.0f pixels a drawn frame\n",
+                (unsigned long long)st.frames, (unsigned long long)st.unchanged, (unsigned long long)st.partial, (unsigned long long)st.full,
+                drawn ? (double)st.pixels / (double)drawn : 0.0);
+    }
+    cui_damage_destroy(app->damage);
+    app->damage = NULL;
 #if CUI__APP_GPU
     if (app->gpu) cui_gpu_destroy(app->gpu);   /* its textures went with cui_set_renderer above */
     app->gpu = NULL;
@@ -180,6 +190,13 @@ void cui_app_destroy(cui_app *app) {
 
 /* NULL means the app that is running: a cui_app_run callback has no other way to name it */
 static cui_app *cui__app_or_current(cui_app *app) { return app ? app : cui__current_app; }
+
+bool cui_app_damage_stats(cui_app *app, cui_damage_stats *out) {
+    app = cui__app_or_current(app);
+    if (!app || !out || !app->desc.damage_tracking || !app->gl) return false;
+    *out = cui_damage_get_stats(app->damage);
+    return true;
+}
 
 cui_ctx *cui_app_ui(cui_app *app) { app = cui__app_or_current(app); return app ? app->ui : NULL; }
 void cui_app_quit(cui_app *app) { app = cui__app_or_current(app); if (app) app->running = false; }
@@ -244,7 +261,13 @@ void cui__app_render(cui_app *app) {
         cui_gpu_render(app->gpu, dd);
     } else
 #endif
-    if (app->gl) {
+    if (app->gl && app->desc.damage_tracking && !app->damage) app->damage = cui_damage_create();
+    if (app->gl && app->damage) {
+        /* a frame that changed nothing is neither drawn nor swapped: cui_app_frame paces it by the clock */
+        app->held_frame = !cui_gl_render_damaged(app->gl, dd, app->damage, app->force_present || !app->presented_once);
+        app->force_present = false;
+        if (!app->held_frame) cui__plat_gl_swap(app);
+    } else if (app->gl) {
         cui_gl_render(app->gl, dd, true);
         cui__plat_gl_swap(app);
     } else {
@@ -307,7 +330,8 @@ bool cui_app_frame(cui_app *app) {
             app->hz = hz >= 24 && hz <= 1000 ? hz : 60;
             app->hz_checked = now;
         }
-        if ((app->gl || app->gpu) && !app->desc.no_vsync && !app->vsync_off) {
+        if (app->held_frame) app->pace_frames = 0;   /* no swap waited: it says nothing of whether swaps wait */
+        else if ((app->gl || app->gpu) && !app->desc.no_vsync && !app->vsync_off) {
             /* two runs of 20 frames in a row faster than the display: the swap does not wait
              * (one is not enough: after a pause a driver may queue a few frames without waiting) */
             if (app->pace_frames++ == 0) app->pace_start = app->last_present;
@@ -318,7 +342,7 @@ bool cui_app_frame(cui_app *app) {
                 app->pace_frames = 0;
             }
         }
-        if ((!app->gl && !app->gpu) || app->desc.no_vsync || app->vsync_off) {
+        if ((!app->gl && !app->gpu) || app->desc.no_vsync || app->vsync_off || app->held_frame) {
             /* one frame per period, counted from when the last one began; events that come
              * in the meantime are taken in but do not start the frame early */
             double until = app->last_time + 1.0 / (app->desc.no_vsync && app->hz < 120 ? 120 : app->hz);

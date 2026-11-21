@@ -86,7 +86,8 @@ set(CUI_CORE_SOURCES
     src/cui_terminal.c
     src/cui_emoji.c
     src/render/cui_render_sw.c
-    src/render/cui_render_gl.c)
+    src/render/cui_render_gl.c
+    src/render/cui_damage.c)
 
 if(CUI_DEFAULT_FONTS)
     list(APPEND CUI_CORE_SOURCES src/cui_font_data.c src/cui_inflate.c)

@@ -19,7 +19,9 @@ struct cui_app {
     bool running;
     bool in_frame;
     bool presented_once;
-    bool force_present;       /* software: the window needs the whole picture again (exposed, resized) */
+    bool force_present;       /* the window needs the whole picture again (exposed, resized) */
+    struct cui_damage *damage; /* OpenGL: only what changed is drawn (cui_app_desc.damage_tracking), else NULL */
+    bool held_frame;          /* the last frame changed nothing and was not presented: no swap paced it */
     double last_time;
     double last_present;
     double hz, hz_checked;     /* display refresh rate (60 when the backend cannot tell) and when it was asked */

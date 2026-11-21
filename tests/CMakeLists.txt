@@ -77,6 +77,12 @@ target_link_libraries(cui_bench PRIVATE cui::cui)
 
 # The gallery clicked and scrolled fast in a real window, to compare renderers (see tests/gpu_bench.c); needs a window, so ctest does not run it
 if(CUI_WITH_APP)
+    # A little chrome left alone, hovered and dragged, to see what damage tracking saves (see tests/damage_bench.c); needs a window too
+    add_executable(cui_damage_bench damage_bench.c)
+    target_link_libraries(cui_damage_bench PRIVATE cui::cui)
+    if(WIN32)
+        target_link_libraries(cui_damage_bench PRIVATE psapi)
+    endif()
     add_executable(cui_gpu_bench gpu_bench.c ../examples/gallery_ui.c ../examples/gallery_more.c)
     target_link_libraries(cui_gpu_bench PRIVATE cui::cui)
     if(WIN32)

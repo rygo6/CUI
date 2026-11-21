@@ -44,7 +44,7 @@ def library_sources():
     for name in sorted(os.listdir(src)):
         if name.endswith(".c"):
             files.append(("src/" + name, optional.get(name)))
-    files += [("src/render/cui_render_sw.c", None), ("src/render/cui_render_gl.c", None)]
+    files += [("src/render/cui_render_sw.c", None), ("src/render/cui_render_gl.c", None), ("src/render/cui_damage.c", None)]
     return files
 
 

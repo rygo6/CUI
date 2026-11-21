@@ -72,6 +72,16 @@ A renderer has two ways to take records:
 - **Draw them as instances.** One four-vertex strip per record, with the corner from the vertex index. Vulkan reads a record as per-instance vertex input and picks a command's first record with the draw's first instance. OpenGL 3.3, OpenGL ES 3.0 and WebGL 2 have no first instance, so the OpenGL renderer uploads the records as a texture of 32-bit words, sets one integer uniform to the command's first record, and reads record `first + gl_InstanceID` with `texelFetch`.
 - **Write them back out as vertices.** `cui_expand_instances` returns draw data with every record as four vertices and six indices, in the same order, for a renderer that draws vertices only. The software, Direct3D 12 and Metal renderers do this.
 
+## Damage
+
+With `cui_app_desc.damage_tracking` (OpenGL only), a frame draws just what changed. It needs the records above, and turns them on.
+
+`cui_damage_track` compares a frame's records with the last frame's: from the front while they match, then from the back while they match. What is left in the middle of either frame is what changed, and the bounding box of those shapes is the damage. A shape that appears (a hover highlight) shifts every record after it without damaging any of them. Two changes far apart in the draw order damage what lies between them as well, so the rectangle is never too small, only sometimes larger than it could be. Vertices are not compared shape by shape: when they change at all, everything their commands can draw in is damaged. A texture whose pixels change under a record that does not change is not seen.
+
+`cui_gl_render_damaged` keeps an image of the window, clears and redraws only the damaged rectangle in it (`cui_damage_clip` leaves the commands and records that touch it), and copies the image to the window. It returns false when nothing changed, and then there is nothing to swap: `cui_app` paces such frames by the clock. A rectangle over 60% of the window is drawn as the whole window.
+
+`CUI_DAMAGE_CHECK=1` draws every partly drawn frame whole as well and reports any pixel that differs; `CUI_DAMAGE_STATS=1` prints how many frames were unchanged, partial and full.
+
 ## Reference shader (GLSL 330)
 
 ```glsl
