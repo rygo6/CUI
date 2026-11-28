@@ -603,6 +603,7 @@ static void cui__sw_paint_rect(cui_sw_renderer *r, const cui_draw_data *dd, void
     cui_color cc = dd->clear_color;
     uint8_t c4[4] = { cc.r, cc.g, cc.b, 255 };
     if (fmt == CUI_SW_BGRA) { c4[0] = cc.b; c4[2] = cc.r; }
+    if (!cc.r && !cc.g && !cc.b && !cc.a) c4[3] = 0;   /* a surface: clear where nothing is drawn, as the OpenGL renderer clears it */
     for (int y = y0; y < y1; y++) {
         uint8_t *row = (uint8_t *)pixels + (size_t)y * (size_t)stride + (size_t)x0 * 4;
         for (int x = 0, n = x1 - x0; x < n; x++) memcpy(row + (size_t)x * 4, c4, 4);
@@ -696,8 +697,9 @@ static void cui__sw_tile_hashes(cui_sw_renderer *r, const cui_draw_data *dd, uin
 
 /** Paints the entire screenshot without changing the window's incremental render state. */
 void cui__sw_render_screenshot(cui_sw_renderer *r, const cui_draw_data *dd, void *rgba, int stride) {
+    if (!r || !dd || !(dd = cui_expand_instances(&r->expanded, dd))) return;
     int width = dd->width_px, height = dd->height_px;
-    if (!r || width <= 0 || height <= 0) return;
+    if (width <= 0 || height <= 0) return;
     cui__sw_paint_rect(r, dd, rgba, width, height, stride, CUI_SW_RGBA, 0, 0, width, height);
 }
 

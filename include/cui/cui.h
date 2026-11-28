@@ -489,6 +489,10 @@ CUI_API cui_font cui_font_load_memory(cui_ctx *ui, const void *data, size_t size
 CUI_API cui_font cui_font_load_file(cui_ctx *ui, const char *path);
 /* Replace one of the built-in roles (e.g. use your brand font as CUI_FONT_BODY). */
 CUI_API void cui_font_set_role(cui_ctx *ui, cui_font role, cui_font font);
+/* Mark a loaded font as an icon font: each glyph is drawn in a box of `size`
+ * by `size` with its baseline at the bottom, with no tracking, kerning or
+ * text gamma, as the built-in icons are. */
+CUI_API void cui_font_set_icon(cui_ctx *ui, cui_font font, bool icon);
 /* Glyphs missing from `font` are looked up in `fallback` (e.g. CJK, emoji). */
 CUI_API void cui_font_add_fallback(cui_ctx *ui, cui_font font, cui_font fallback);
 
@@ -542,6 +546,7 @@ typedef struct cui_box {
     cui_elevation elevation;
     bool scroll_x, scroll_y;   /* make the box a scroll area (clips content) */
     bool clip;                 /* clip children to the box */
+    bool surface;              /* the box and what is in it are a surface: a draw list and a picture of their own (see Surfaces) */
     float opacity;             /* 0 means 1 (fully opaque) */
     cui_direction direction;   /* inherited by default; mirrors horizontal layout and padding */
 } cui_box;
@@ -1219,6 +1224,7 @@ CUI_API cui_texture cui_image_create(cui_ctx *ui, int w, int h, const void *rgba
  * the byte distance between source rows: at least w * 4, or 0 for tightly packed. */
 CUI_API void cui_image_update(cui_ctx *ui, cui_texture tex, int x, int y, int w, int h, const void *rgba, int stride);
 CUI_API cui_texture cui_image_load(cui_ctx *ui, const char *path, int *w, int *h);   /* UTF-8 path, PNG/JPEG via stb_image */
+CUI_API cui_texture cui_image_load_memory(cui_ctx *ui, const void *data, size_t size, int *w, int *h);   /* an encoded PNG/JPEG held in memory */
 CUI_API void cui_image_destroy(cui_ctx *ui, cui_texture tex);
 typedef struct cui_image_opts {
     int _;
@@ -5231,7 +5237,11 @@ CUI_API float cui_animate_spring(cui_ctx *ui, cui_id id, float target, float dur
 
 /* Vertex shading modes. See docs/rendering.md for the reference shader. */
 enum { CUI_SHADE_TEXT = 0, CUI_SHADE_RRECT = 1, CUI_SHADE_SHADOW = 2, CUI_SHADE_IMAGE = 3, CUI_SHADE_SOLID = 4,
-       CUI_SHADE_DITHER = 5   /* ordered dither: dots of border_color where border <= threshold(u, v) < color.a */ };
+       CUI_SHADE_DITHER = 5,  /* ordered dither: dots of border_color where border <= threshold(u, v) < color.a */
+       /* cui_instance only: a straight stroke. (x0, y0) and (x1, y1) are its two ends, param its
+        * thickness and r_tl the radius of its ends (0: cut square). The quad lies along the stroke
+        * and is shaded as an RRECT, which is the mode its vertices carry. */
+       CUI_SHADE_LINE = 6 };
 
 typedef struct cui_vertex {
     float x, y;            /* position in pixels */
@@ -5247,14 +5257,15 @@ typedef struct cui_vertex {
 
 /* One axis-aligned shape, expanded to a quad by the renderer. Lengths are in quarter pixels.
  * The quad is the shape grown on every side by a margin the mode decides: 1 pixel for RRECT and
- * IMAGE, three times the blur sigma for SHADOW, none for TEXT. 40 bytes, no padding. */
+ * IMAGE, three times the blur sigma for SHADOW, none for TEXT. A sheared quad keeps its bottom
+ * edge and slides the rest sideways; the shape inside it is not slanted. 40 bytes, no padding. */
 typedef struct cui_instance {
     int16_t x0, y0, x1, y1;            /* shape bounds, quarter pixels */
     uint16_t u0, v0, u1, v1;           /* texture rectangle of the shape, 0..65535 across the texture */
     uint16_t r_tl, r_tr, r_br, r_bl;   /* corner radii, quarter pixels */
     uint16_t param;                    /* border width (RRECT) or blur sigma (SHADOW), quarter pixels */
-    uint8_t mode;                      /* CUI_SHADE_TEXT, RRECT, SHADOW or IMAGE */
-    uint8_t reserved;
+    uint8_t mode;                      /* CUI_SHADE_TEXT, RRECT, SHADOW, IMAGE or LINE */
+    int8_t shear;                      /* slant in 128ths: the quad leans right by shear / 128 of its height above the bottom edge */
     cui_color color_top;               /* fill at the top edge */
     cui_color color_bottom;            /* fill at the bottom edge */
     cui_color border_color;
@@ -5288,8 +5299,41 @@ typedef struct cui_draw_data {
  * bottom left, for a renderer that draws vertices only. */
 CUI_API void cui_instance_vertices(const cui_instance *instance, cui_vertex out[4]);
 
-/* Valid after cui_end_frame until the next cui_begin_frame. */
+/* Valid after cui_end_frame until the next cui_begin_frame: the window's draw list. That is the
+ * whole frame, unless parts of the window were made surfaces: those have lists of their own. */
 CUI_API const cui_draw_data *cui_get_draw_data(cui_ctx *ui);
+
+/* Surfaces. A surface is a zone of the window, a rectangle, with a draw list of its own. What
+ * becomes of the lists is the renderer's choice, not the UI's: each into a picture of its own
+ * that the system lays over the window (Wayland subsurfaces), so that a change inside a surface
+ * redraws and shows that small picture alone and moving one redraws nothing; or all into the one
+ * picture of the window, the window's list first and then each surface's where it lies. Zone off
+ * what changes by itself or often: a tab bar, a row with a status light, a spinner, a moving
+ * picture. A UI that zones nothing has one list for one picture. There are no layers the size of
+ * the window laid over one another.
+ *
+ * Set cui_box.surface on a box, and it and all in it are a surface the size of the box. In a
+ * paint callback, cui_surface_begin and cui_surface_end do the same for a rectangle in points;
+ * the same id is the same surface from frame to frame (begun twice in a frame it is two, the
+ * same two every frame). What is drawn inside is cut to the zone, and lies over what the window
+ * draws there whatever the order of the calls: a later surface lies over an earlier one. There
+ * are CUI_SURFACES of them; one more is drawn where it is, into the list around it. */
+#define CUI_SURFACES 16
+CUI_API void cui_surface_begin(cui_ctx *ui, const char *id, cui_rect rect);
+CUI_API void cui_surface_end(cui_ctx *ui);
+/* After cui_end_frame: the surface in a slot (0 to CUI_SURFACES - 1; a surface keeps its slot
+ * while it is drawn every frame), false when the slot holds none this frame. It gives where the
+ * surface is in pixels from the window's top left, its order among the frame's surfaces (a
+ * higher one lies over a lower), and its shapes from its own top left corner, as draw data of
+ * its own size with a clear color of no alpha. A renderer draws cui_get_draw_data and then,
+ * lowest order first, each surface's list at its place, or each into a target of its own. */
+typedef struct cui_surface {
+    cui_id id;
+    int x, y, w, h;
+    int order;
+    const cui_draw_data *draw;
+} cui_surface;
+CUI_API bool cui_get_surface(cui_ctx *ui, int slot, cui_surface *out);
 
 /* ------------------------------------------------------------------------ */
 /* Named-argument macros                                                    */

@@ -19,7 +19,15 @@ struct cui_app {
     bool running;
     bool in_frame;
     bool presented_once;
-    bool force_present;       /* software: the window needs the whole picture again (exposed, resized) */
+    bool force_present;       /* the window needs the whole picture again (exposed, resized) */
+    bool live_resize;         /* the window is being dragged to a new size (Cocoa, Win32) */
+    struct cui_damage *surface_damage[CUI_SURFACES];   /* the same for each surface the system shows by itself, made when one is used */
+    int native_surfaces;         /* surfaces are the system's own: 0 not yet asked, 1 yes, 2 no (drawn as one list) */
+    struct cui_presenter *presenter;   /* the GPU renderers: shows the window's list and its surfaces of the system's */
+    struct { bool shown; int x, y, w, h, order; } surface[CUI_SURFACES];   /* each slot as the system shows it */
+    struct cui_damage *damage; /* OpenGL: only what changed is drawn (cui_app_desc.damage_tracking), else NULL */
+    double pace_anchor;       /* damage tracking: when the current display period began, as the last swap that waited showed */
+    bool held_frame;          /* the last frame changed nothing and was not presented: no swap paced it */
     double last_time;
     double last_present;
     double hz, hz_checked;     /* display refresh rate (60 when the backend cannot tell) and when it was asked */
@@ -62,6 +70,19 @@ double cui__plat_now(void);
 int cui__plat_system_dark(void);                      /* -1 unknown, 0 light, 1 dark */
 bool cui__plat_file_dialog(cui_app *app, const cui_file_dialog_opts *o, char *out, size_t cap);
 bool cui__plat_open_url(const char *url);
+
+
+/* Surfaces (cui_box.surface) as surfaces of the system's, which it lays over the window.
+ * cui__plat_surface_begin makes the one for `slot` the one OpenGL draws to: w by h pixels with its
+ * top left at x, y pixels of the window, above the surfaces of lower order. False when the backend
+ * has no such surfaces: the frame is then drawn as one list. cui__plat_surface_end shows what was
+ * drawn and makes the window the one drawn to again. cui__plat_surface_move puts one
+ * that was drawn before somewhere else, or elsewhere in the order, without drawing it again.
+ * cui__plat_surface_hide takes one that holds nothing off the screen. */
+bool cui__plat_surface_begin(cui_app *app, int slot, int x, int y, int w, int h, int order);
+void cui__plat_surface_end(cui_app *app, int slot);
+void cui__plat_surface_move(cui_app *app, int slot, int x, int y, int order);
+void cui__plat_surface_hide(cui_app *app, int slot);
 
 /* Shared helpers for backends. */
 void cui__app_render(cui_app *app);                   /* end frame (if open), render, present */

@@ -596,9 +596,14 @@ static void md_paint_inline(cui_ctx *ui, cui_node *n, void *data) {
         float tx = x + (s->lead ? f->pad : 0);
         int v0 = ui->dl.vtx_count;
         bool sheared = (s->style & MS_EM) != 0;
-        ui->dl.vertices_only += sheared;
+        /* records lean by themselves; md_shear leans what stayed vertices */
+        if (sheared) {
+            cui_xform xf = ui->dl.xform_stack[ui->dl.xform_depth - 1];
+            ui->dl.shear = MD_SHEAR;
+            ui->dl.shear_base = base * ui->scale * xf.scale + xf.oy;
+        }
         cui__draw_text_line(ui, font, size, tx, base - cui__font_ascent(ui, font, size), col, s->p, s->len, false);
-        ui->dl.vertices_only -= sheared;
+        ui->dl.shear = 0;
         if (sheared) md_shear(ui, v0, base);
         if (s->style & MS_STRIKE) cui_draw_rect(ui, (cui_rect){ x, base - f->size * 0.3f, s->w, th }, CUI_CORNERS(0), col);
         if (s->link >= 0) {

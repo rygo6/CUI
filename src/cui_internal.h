@@ -192,19 +192,43 @@ cui_font cui__resolve_font(cui_ctx *ui, cui_font f);
 /* ---- draw list ---- */
 typedef struct cui_xform { float scale, ox, oy, alpha, tx, ty; } cui_xform;
 
+/* The arrays of the window's draw list, or of one surface's, while another is being drawn into. */
+typedef struct cui_draw_buf {
+    cui_vertex *vtx; int vtx_count, vtx_cap;
+    uint32_t *idx; int idx_count, idx_cap;
+    cui_draw_cmd *cmd; int cmd_count, cmd_cap;
+    cui_instance *inst; int inst_count, inst_cap;
+} cui_draw_buf;
+
+/* A zone of the window drawn into a list of its own (cui_box.surface, cui_surface_begin). */
+typedef struct cui__surface {
+    cui_id id;          /* 0: the slot is free */
+    cui_id base;        /* the id it was begun with: id itself, but for the second and later surfaces of one id in a frame */
+    int x, y, w, h;     /* pixels, from the window's top left */
+    int order;          /* among this frame's surfaces: later ones lie over earlier ones */
+    bool used;          /* drawn into this frame */
+} cui__surface;
+
 typedef struct cui_draw_list {
     cui_vertex *vtx; int vtx_count, vtx_cap;
     uint32_t *idx; int idx_count, idx_cap;
     cui_draw_cmd *cmd; int cmd_count, cmd_cap;
     cui_instance *inst; int inst_count, inst_cap;
     bool instanced;        /* quads may be emitted as instances */
-    int vertices_only;     /* >0: a caller edits the vertices it emits, so quads stay vertices */
+    float shear;           /* not 0: quads lean right by this much of their height above shear_base (synthesized italics) */
+    float shear_base;      /* the line the lean is measured from, y in pixels */
     cui_rect clip_stack[64]; int clip_depth;
     cui_xform xform_stack[32]; int xform_depth;
     cui_texture cur_tex;
 } cui_draw_list;
 
 void cui__draw_reset(cui_ctx *ui);
+void cui__draw_finish(cui_ctx *ui);   /* fills draw_data, window_data and surf_data */
+/* What is drawn until cui__surface_pop goes into the surface `id`, which covers r (points). */
+void cui__surface_push(cui_ctx *ui, cui_id id, cui_rect r);
+void cui__surface_pop(cui_ctx *ui);
+const cui_draw_data *cui__draw_data_merged(cui_ctx *ui);
+void cui__draw_free(cui_ctx *ui);
 void cui__push_xform(cui_ctx *ui, float scale, float ox, float oy, float alpha, float tx, float ty);
 void cui__pop_xform(cui_ctx *ui);
 void cui__draw_glyph_quad(cui_ctx *ui, float x0, float y0, float x1, float y1,
@@ -285,6 +309,7 @@ typedef struct cui_node {
     int abs_anchor;            /* absolute: position relative to this node (-1 = parent) */
     int child_count;
     uint32_t flags;
+    bool surface;       /* the node and what is in it are drawn into a surface of their own (cui_box.surface) */
 
     /* layout input */
     uint8_t direction;
@@ -636,8 +661,16 @@ struct cui_ctx {
     int atlas_tex_w, atlas_tex_h;
 
     /* drawing */
-    cui_draw_list dl;
-    cui_draw_data draw_data;
+    cui_draw_list dl;          /* its arrays are those of the list being drawn into: the window's or a surface's */
+    cui_draw_data draw_data;   /* the window's list: what is in no surface */
+    cui_draw_data merged_data; /* cui__draw_data_merged */
+    cui_draw_buf dbufs[1 + CUI_SURFACES];      /* the arrays of the lists that are not current: 0 the window's, 1 + slot a surface's */
+    cui_draw_data surf_data[CUI_SURFACES];     /* each surface's shapes from its own corner, after cui_end_frame */
+    cui__surface surf[CUI_SURFACES];
+    cui_draw_buf flat;         /* the arrays of merged_data when there are surfaces */
+    int dbuf, surf_order;      /* the current list, and how many surfaces this frame has begun */
+    bool flat_stale;           /* there are surfaces and merged_data has not been made for this frame */
+    int dbuf_stack[8], dbuf_depth;
 
     /* widgets */
     cui_popup popups[32]; int popup_count;

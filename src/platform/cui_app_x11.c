@@ -1014,3 +1014,9 @@ void cui__plat_placement(cui_app *app, cui_window_placement *out) {
     out->has_position = x->normal_pos_known;
     out->state = maximized ? CUI_WINDOW_MAXIMIZED : CUI_WINDOW_NORMAL;
 }
+
+/* no surfaces of the system's here yet: the frame is drawn as one list */
+bool cui__plat_surface_begin(cui_app *app, int slot, int x, int y, int w, int h, int order) { (void)app; (void)slot; (void)x; (void)y; (void)w; (void)h; (void)order; return false; }
+void cui__plat_surface_end(cui_app *app, int slot) { (void)app; (void)slot; }
+void cui__plat_surface_move(cui_app *app, int slot, int x, int y, int order) { (void)app; (void)slot; (void)x; (void)y; (void)order; }
+void cui__plat_surface_hide(cui_app *app, int slot) { (void)app; (void)slot; }

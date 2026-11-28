@@ -32,6 +32,20 @@ extern cui_x11_window *cui__plat_x11_window(cui_app *app) __attribute__((weak));
 /* The Wayland backend's: false when a frame must not be drawn now (the window is hidden, and a
  * presentation would wait for it without end, or the window took another size than w by h). */
 extern bool cui__plat_gpu_frame(cui_app *app, int width, int height) __attribute__((weak));
+extern void *cui__plat_gpu_surface(cui_app *app, int slot, int x, int y, int w, int h, int order) __attribute__((weak));
+extern bool cui__plat_live_resize(cui_app *app) __attribute__((weak));
+#endif
+
+#if CUI__APP_GPU
+static void *cui__app_presented_surface(void *user, int slot, int x, int y, int w, int h, int order) {
+#if defined(__linux__)
+    if (cui__plat_gpu_surface) return cui__plat_gpu_surface(user, slot, x, y, w, h, order);
+#endif
+    (void)user; (void)slot; (void)x; (void)y; (void)w; (void)h; (void)order;
+    return NULL;
+}
+
+static void cui__app_presented_hidden(void *user, int slot) { cui__plat_surface_hide(user, slot); }
 #endif
 
 static void cui__app_make_software(cui_app *app) {
@@ -85,7 +99,8 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
     memset(&cd, 0, sizeof cd);
     cd.theme = mode;
     cd.accent = d->accent;
-    cd.instanced_quads = d->instanced_quads;
+    d->damage_tracking = d->damage_tracking || !d->full_redraw;
+    cd.instanced_quads = d->damage_tracking || d->instanced_quads;
     app->ui = cui_create(&cd);
     if (!app->ui) { free(app); return NULL; }
     if (!cui__plat_init(app)) {
@@ -95,9 +110,11 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
         return NULL;
     }
 #if CUI__APP_GPU
-    /* the platform's GPU renderer (Direct3D 12, Vulkan or Metal), when asked for:
-     * CUI_RENDERER_GPU, or CUI_RENDERER=gpu or its name (d3d12, vulkan, metal) */
-    if (d->renderer == CUI_RENDERER_GPU || cui__env_is("CUI_RENDERER", "gpu") || cui__env_is("CUI_RENDERER", CUI__APP_GPU_NAME)) {
+    /* the platform's GPU renderer (Direct3D 12, Vulkan or Metal), first unless OpenGL or software
+     * was asked for (CUI_RENDERER_OPENGL or _SOFTWARE, or CUI_RENDERER=opengl or software) */
+    bool asked_gpu = d->renderer == CUI_RENDERER_GPU || cui__env_is("CUI_RENDERER", "gpu") || cui__env_is("CUI_RENDERER", CUI__APP_GPU_NAME);
+    bool asked_other = cui__env_is("CUI_RENDERER", "opengl") || cui__env_is("CUI_RENDERER", "software");
+    if (asked_gpu || (d->renderer == CUI_RENDERER_AUTO && !asked_other)) {
 #if defined(__linux__)
         void *gpu_window = cui__plat_x11_window ? cui__plat_x11_window(app) : NULL;   /* only the X11 and Wayland backends lend their window */
 #else
@@ -106,7 +123,7 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
         const char *plat = cui__plat_name();
         if (gpu_window && (!strcmp(plat, "win32") || !strcmp(plat, "cocoa") || !strcmp(plat, "x11") || !strcmp(plat, "wayland")))
             app->gpu = cui_gpu_create(gpu_window, !d->no_vsync);
-        if (!app->gpu) fprintf(stderr, "cui: the %s renderer is unavailable\n", CUI__APP_GPU_NAME);
+        if (!app->gpu && asked_gpu) fprintf(stderr, "cui: the %s renderer is unavailable\n", CUI__APP_GPU_NAME);
     }
 #endif
     bool want_gl = !app->gpu && d->renderer != CUI_RENDERER_SOFTWARE && !cui__env_is("CUI_RENDERER", "software");
@@ -170,7 +187,12 @@ void cui_app_destroy(cui_app *app) {
     cui_set_renderer(app->ui, NULL);
     if (app->gl) cui_gl_destroy(app->gl);
     app->gl = NULL;
+    cui_damage_destroy(app->damage);
+    app->damage = NULL;
+    for (int i = 0; i < CUI_SURFACES; i++) { cui_damage_destroy(app->surface_damage[i]); app->surface_damage[i] = NULL; }
 #if CUI__APP_GPU
+    cui_presenter_destroy(app->presenter);
+    app->presenter = NULL;
     if (app->gpu) cui_gpu_destroy(app->gpu);   /* its textures went with cui_set_renderer above */
     app->gpu = NULL;
 #endif
@@ -186,6 +208,13 @@ void cui_app_destroy(cui_app *app) {
 
 /* NULL means the app that is running: a cui_app_run callback has no other way to name it */
 static cui_app *cui__app_or_current(cui_app *app) { return app ? app : cui__current_app; }
+
+bool cui_app_damage_stats(cui_app *app, cui_damage_stats *out) {
+    app = cui__app_or_current(app);
+    if (!app || !out || !app->desc.damage_tracking || !app->damage) return false;
+    *out = cui_damage_get_stats(app->damage);
+    return true;
+}
 
 cui_ctx *cui_app_ui(cui_app *app) { app = cui__app_or_current(app); return app ? app->ui : NULL; }
 void cui_app_quit(cui_app *app) { app = cui__app_or_current(app); if (app) app->running = false; }
@@ -238,21 +267,108 @@ void cui__app_render(cui_app *app) {
         cui_end_frame(app->ui);
         app->in_frame = false;
     }
+    /* the window's list, and the surfaces' in the order they lie in. OpenGL takes them as they are, each into a surface
+     * of the system's or all into the window one after another; the other renderers still take them copied into one list. */
     const cui_draw_data *dd = cui_get_draw_data(app->ui);
     int w = dd->width_px, h = dd->height_px;
     if (w <= 0 || h <= 0) return;
+    cui_surface zone[CUI_SURFACES];
+    int zone_slot[CUI_SURFACES], zones = 0;
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        cui_surface sf;
+        if (!cui_get_surface(app->ui, i, &sf)) continue;
+        int k = zones++;
+        while (k > 0 && zone[k - 1].order > sf.order) { zone[k] = zone[k - 1]; zone_slot[k] = zone_slot[k - 1]; k--; }
+        zone[k] = sf; zone_slot[k] = i;
+    }
+    if (!app->gl) dd = cui__draw_data_merged(app->ui);
 #if CUI__APP_GPU
     if (app->gpu) {
 #if defined(__linux__)
         cui__plat_x11_window(app);   /* the renderer reads the window's size from it */
         if (!cui__plat_gpu_frame || cui__plat_gpu_frame(app, w, h))
 #endif
-        cui_gpu_render(app->gpu, dd);
+        {
+            bool live = app->live_resize;
+#if defined(__linux__)
+            if (cui__plat_live_resize) live = cui__plat_live_resize(app);
+            if (live) cui_request_wakeup(app->ui, 0.3f);   /* a drag held still ends without a configure */
+#endif
+            cui_gpu_live_resize(app->gpu, live);
+            if (app->desc.damage_tracking && !app->damage) app->damage = cui_damage_create();
+            bool force = app->force_present || !app->presented_once;
+            if (zones && app->damage && !app->native_surfaces) app->native_surfaces = cui_gpu_surfaces(app->gpu) ? 1 : 2;
+            if (app->damage && app->native_surfaces == 1 && !app->presenter) {
+                cui_presenter_desc desc = { app->damage, app, cui__app_presented_surface, cui__app_presented_hidden };
+                if (!(app->presenter = cui_presenter_create(&desc))) app->native_surfaces = 2;
+            }
+            if (app->damage && app->native_surfaces == 1) {
+                /* each surface is a picture of the system's own: the window is drawn without them, and one that changed by itself */
+                int shown = cui_presenter_show(app->presenter, app->gpu, app->ui, force);
+                app->held_frame = !(shown & CUI_PRESENTED_WINDOW);
+                if (shown & CUI_PRESENTED_LOST) {
+                    /* a surface could not have a picture of its own: every list into the window's from the next frame on */
+                    app->native_surfaces = 2;
+                    cui_presenter_reset(app->presenter, app->gpu);
+                    cui_request_redraw(app->ui);
+                }
+            }
+            else if (app->damage) app->held_frame = !cui_gpu_render_damaged(app->gpu, dd, app->damage, force);
+            else cui_gpu_render(app->gpu, dd);
+        }
         app->force_present = false;
     } else
 #endif
-    if (app->gl) {
+    if (app->gl && app->desc.damage_tracking && (app->damage || (app->damage = cui_damage_create()))) {
+        /* a frame that changed nothing is neither drawn nor swapped: cui_app_frame paces it by the clock */
+        bool force = app->force_present || !app->presented_once;
+        cui_surface sf;
+        if (zones && !app->native_surfaces) {
+            /* whether the system has surfaces to give is found out with the first one */
+            sf = zone[0];
+            bool native = cui__plat_surface_begin(app, zone_slot[0], sf.x, sf.y, sf.w, sf.h, sf.order);
+            if (native) cui__plat_surface_end(app, zone_slot[0]);
+            app->native_surfaces = native ? 1 : 2;
+        }
+        if (app->native_surfaces == 1) {
+            /* each surface is one of the system's: the window is drawn without them, and one that changed is drawn and shown by itself */
+            app->held_frame = !cui_gl_render_damaged(app->gl, dd, app->damage, force);
+            if (!app->held_frame) cui__plat_gl_swap(app);
+            for (int i = 0; i < CUI_SURFACES; i++) {
+                __typeof__(app->surface[0]) *at = &app->surface[i];
+                if (!cui_get_surface(app->ui, i, &sf)) {
+                    if (at->shown) { cui__plat_surface_hide(app, i); at->shown = false; cui_damage_reset(app->surface_damage[i]); }
+                    continue;
+                }
+                if (!app->surface_damage[i] && !(app->surface_damage[i] = cui_damage_create())) continue;
+                cui_rect rect;
+                bool full = false, moved = !at->shown || at->x != sf.x || at->y != sf.y || at->order != sf.order;
+                bool changed = cui_damage_track(app->surface_damage[i], sf.draw, &rect, &full) || !at->shown || force || at->w != sf.w || at->h != sf.h;
+                if (changed && cui__plat_surface_begin(app, i, sf.x, sf.y, sf.w, sf.h, sf.order)) {
+                    cui_gl_render_surface(app->gl, sf.draw);
+                    cui__plat_surface_end(app, i);
+                    at->shown = true;
+                } else if (moved && at->shown) {
+                    cui__plat_surface_move(app, i, sf.x, sf.y, sf.order);
+                }
+                at->x = sf.x; at->y = sf.y; at->w = sf.w; at->h = sf.h; at->order = sf.order;
+            }
+        } else {
+            /* all into the window's own picture: its list, then each surface's where it lies */
+            cui_render_list lists[1 + CUI_SURFACES] = { { dd, 0, 0, app->damage, 0 } };
+            int count = 1;
+            for (int i = 0; i < zones; i++) {
+                int slot = zone_slot[i];
+                if (!app->surface_damage[slot] && !(app->surface_damage[slot] = cui_damage_create())) continue;
+                lists[count++] = (cui_render_list){ zone[i].draw, zone[i].x, zone[i].y, app->surface_damage[slot], zone[i].id };
+            }
+            app->held_frame = !cui_gl_render_lists(app->gl, lists, count, force);
+            if (!app->held_frame) cui__plat_gl_swap(app);
+        }
+        app->force_present = false;
+    } else if (app->gl) {
         cui_gl_render(app->gl, dd, true);
+        for (int i = 0; i < zones; i++) cui_gl_render_at(app->gl, zone[i].draw, zone[i].x, zone[i].y, h);
         cui__plat_gl_swap(app);
         app->force_present = false;
     } else {
@@ -315,7 +431,8 @@ bool cui_app_frame(cui_app *app) {
             app->hz = hz >= 24 && hz <= 1000 ? hz : 60;
             app->hz_checked = now;
         }
-        if ((app->gl || app->gpu) && !app->desc.no_vsync && !app->vsync_off && !app->present_fast) {
+        if (app->held_frame) app->pace_frames = 0;   /* no swap waited: it says nothing of whether swaps wait */
+        else if ((app->gl || app->gpu) && !app->desc.no_vsync && !app->vsync_off && !app->present_fast) {
             /* two runs of 20 frames in a row faster than the display: the swap does not wait
              * (one is not enough: after a pause a driver may queue a few frames without waiting) */
             if (app->pace_frames++ == 0) app->pace_start = app->last_present;
@@ -326,12 +443,21 @@ bool cui_app_frame(cui_app *app) {
                 app->pace_frames = 0;
             }
         }
-        if ((!app->gl && !app->gpu) || app->desc.no_vsync || app->vsync_off || app->present_fast) {
+        /* Damage tracking: a frame that was not presented had no swap to wait in, and the swap after
+         * it does not wait either. Such frames are counted in whole periods from the last frame a
+         * swap paced, so that one frame is built a period and waking late does not add up. */
+        double period = 1.0 / app->hz;
+        if (app->damage && (app->pace_anchor <= 0 || now - app->pace_anchor > 1.5 * period)) app->pace_anchor = app->last_time;
+        bool early = app->damage && now - app->pace_anchor < 0.5 * period;
+        if ((!app->gl && !app->gpu) || app->desc.no_vsync || app->vsync_off || app->present_fast || app->held_frame || early) {
             /* one frame per period, counted from when the last one began; events that come
              * in the meantime are taken in but do not start the frame early */
             double until = app->last_time + 1.0 / (app->desc.no_vsync && app->hz < 120 ? 120 : app->hz);
+            if (app->damage) app->pace_anchor = until = app->pace_anchor + period;
             for (double left = until - now; left > 0.0005 && app->running; left = until - cui__plat_now())
                 cui__plat_wait(app, left);
+        } else if (app->damage) {
+            app->pace_anchor = now;   /* a swap waited for the display: this frame begins as it refreshed */
         }
     } else {
         app->pace_frames = 0;
@@ -384,7 +510,7 @@ bool cui_app_screenshot(cui_app *app, void *rgba, int width, int height) {
             cui_end_frame(app->ui);
             app->in_frame = false;
         }
-        dd = cui_get_draw_data(app->ui);
+        dd = cui__draw_data_merged(app->ui);
 #if defined(__linux__)
         cui__plat_x11_window(app);   /* the renderer reads the window's size from it */
 #endif
@@ -395,7 +521,7 @@ bool cui_app_screenshot(cui_app *app, void *rgba, int width, int height) {
     }
 #endif
     if (app->in_frame) cui__app_render(app);
-    dd = cui_get_draw_data(app->ui);
+    dd = cui__draw_data_merged(app->ui);
     int w = dd->width_px, h = dd->height_px;
     if (app->gl) {
         /* re-render without swapping so the back buffer holds the frame */

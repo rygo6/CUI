@@ -90,6 +90,7 @@ void cui__apply_box(cui_ctx *ui, cui_node *n, const cui_box *b) {
     n->elevation = b->elevation;
     n->elevation_alpha = 1;
     if (b->clip) n->flags |= CUI_NF_CLIP;
+    n->surface = b->surface;
     if (b->opacity > 0) n->opacity = b->opacity;
 }
 
@@ -175,6 +176,7 @@ void cui__float_end(cui_ctx *ui) {
 cui_id cui_box_begin(cui_ctx *ui, const cui_box *b) {
     cui_id id = (b && b->id) ? cui_make_id(ui, b->id) : 0;
     bool scroll = b && (b->scroll_x || b->scroll_y);
+    if (b && b->surface && !id) id = cui__auto_id(ui);   /* a surface is known by its id from frame to frame */
     if (scroll) {
         if (!id) id = cui__auto_id(ui);
         cui__scroll_begin_ex(ui, id, b, b->scroll_x);
@@ -1014,6 +1016,8 @@ static void cui__paint_node(cui_ctx *ui, int i, cui_rect clip) {
     }
     bool xf = n->opacity < 0.999f || n->scale != 1.0f || n->tx != 0 || n->ty != 0;
     if (xf) cui__push_xform(ui, n->scale, r.x + r.w * 0.5f, r.y + r.h * 0.5f, n->opacity, n->tx, n->ty);
+    bool surface = n->surface;
+    if (surface) cui__surface_push(ui, n->id, r);
     if (n->flags & (CUI_NF_INTERACTIVE | CUI_NF_BLOCKER | CUI_NF_HIT_OPAQUE | CUI_NF_SCROLL_X | CUI_NF_SCROLL_Y)) {
         cui_rect hr = (n->flags & CUI_NF_BLOCKER) ? r : cui__rect_intersect(cui__xform_rect(ui, r), clip);
         cui__add_hit(ui, n->id, hr, n->flags);
@@ -1069,6 +1073,7 @@ static void cui__paint_node(cui_ctx *ui, int i, cui_rect clip) {
     if (border_after) cui_draw_rect_border(ui, r, n->radius, cui__rgba(0, 0, 0, 0), n->border_color, n->border);
     if (n->paint && (n->flags & CUI_NF_PAINT_AFTER)) n->paint(ui, n, n->paint_data);
     if (n->flags & (CUI_NF_SCROLL_X | CUI_NF_SCROLL_Y)) cui__paint_scrollbars(ui, n, clip);
+    if (surface) cui__surface_pop(ui);
     if (xf) cui__pop_xform(ui);
 }
 

@@ -33,9 +33,10 @@ extern "C" {
 #endif
 
 typedef struct cui_app cui_app;
+struct cui_damage_stats;   /* cui_render.h */
 
 typedef enum cui_renderer_kind {
-    CUI_RENDERER_AUTO = 0,     /* OpenGL, or software when there is no GPU (CPU-drawn OpenGL, X11 and Win32) */
+    CUI_RENDERER_AUTO = 0,     /* the platform's GPU renderer where the build has it, else OpenGL, else software (no GPU, or OpenGL drawn on the CPU) */
     CUI_RENDERER_OPENGL,
     CUI_RENDERER_SOFTWARE,
     CUI_RENDERER_GPU           /* the platform's GPU renderer, in builds that have it: Direct3D 12 on Windows (CUI_D3D12), Vulkan on Linux (CUI_VULKAN), Metal on macOS (CUI_METAL). Also CUI_RENDERER=gpu, or its name */
@@ -71,6 +72,11 @@ typedef struct cui_app_desc {
     bool no_vsync;              /* OpenGL: do not wait for the display; frames are capped at 120 Hz or the refresh rate */
     bool hidden;                /* create the window hidden (tests) */
     bool instanced_quads;       /* cui_ctx_desc.instanced_quads: compact shape records in the draw data */
+    /* Damage tracking is on unless full_redraw is set: only what changed since the last frame is
+     * drawn and presented, and nothing when nothing did. It turns instanced_quads on, which it
+     * compares. damage_tracking is kept for programs that set it. */
+    bool damage_tracking;
+    bool full_redraw;           /* draw and present the whole window every frame */
     cui_renderer_kind renderer;
     cui_theme_mode theme;
     cui_accent accent;
@@ -104,6 +110,10 @@ CUI_API void cui_app_destroy(cui_app *app);
  * called. */
 CUI_API bool cui_app_frame(cui_app *app);
 CUI_API cui_ctx *cui_app_ui(cui_app *app);
+
+/* What damage tracking has drawn so far (cui_app_desc.damage_tracking). False, and out left
+ * alone, when the app does not track damage: it is off, or the renderer is not OpenGL. */
+CUI_API bool cui_app_damage_stats(cui_app *app, struct cui_damage_stats *out);
 
 /* Creates the app, calls frame() until the window closes, destroys it. */
 CUI_API int cui_app_run(const cui_app_desc *desc, void (*frame)(cui_ctx *ui, void *user), void *user);

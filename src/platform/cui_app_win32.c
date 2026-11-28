@@ -425,13 +425,15 @@ static LRESULT CALLBACK cui__win32_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             if (w->in_size_move && w->width > 0 && w->height > 0) cui__app_live_frame(app);
         }
         return 0;
-    case WM_ENTERSIZEMOVE: if (w) w->in_size_move = true; return 0;
+    case WM_ENTERSIZEMOVE: if (w) { w->in_size_move = true; app->live_resize = true; } return 0;
     case WM_SYSCOMMAND: {   /* the title bar's buttons and double-click, the taskbar */
         UINT cmd = (UINT)wp & 0xFFF0;
         if (cmd == SC_MAXIMIZE || cmd == SC_MINIMIZE || cmd == SC_RESTORE) cui__win32_transition(app);
         break;   /* DefWindowProc runs the command */
     }
-    case WM_EXITSIZEMOVE: if (w) w->in_size_move = false; return 0;
+    case WM_EXITSIZEMOVE:
+        if (w) { w->in_size_move = false; app->live_resize = false; cui_request_redraw(ui); }   /* settles sizes */
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
@@ -903,3 +905,9 @@ void cui__plat_placement(cui_app *app, cui_window_placement *out) {
     bool maximized = IsZoomed(w->hwnd) || (IsIconic(w->hwnd) && (wp.flags & WPF_RESTORETOMAXIMIZED));
     out->state = maximized ? CUI_WINDOW_MAXIMIZED : CUI_WINDOW_NORMAL;
 }
+
+/* no surfaces of the system's here yet: the frame is drawn as one list */
+bool cui__plat_surface_begin(cui_app *app, int slot, int x, int y, int w, int h, int order) { (void)app; (void)slot; (void)x; (void)y; (void)w; (void)h; (void)order; return false; }
+void cui__plat_surface_end(cui_app *app, int slot) { (void)app; (void)slot; }
+void cui__plat_surface_move(cui_app *app, int slot, int x, int y, int order) { (void)app; (void)slot; (void)x; (void)y; (void)order; }
+void cui__plat_surface_hide(cui_app *app, int slot) { (void)app; (void)slot; }

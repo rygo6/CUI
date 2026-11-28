@@ -66,18 +66,22 @@ typedef struct cui__egl {
     unsigned (*MakeCurrent)(cui__egl_display, cui__egl_surface draw, cui__egl_surface read, cui__egl_context);
     unsigned (*SwapBuffers)(cui__egl_display, cui__egl_surface);
     unsigned (*SwapInterval)(cui__egl_display, int interval);
+    const char *(*QueryString)(cui__egl_display, int name);
     unsigned (*DestroySurface)(cui__egl_display, cui__egl_surface);
     unsigned (*DestroyContext)(cui__egl_display, cui__egl_context);
     unsigned (*Terminate)(cui__egl_display);
     void *(*GetProcAddress)(const char *name);
     cui__egl_display display;
     cui__egl_config config;
+    cui__egl_config layer_config;   /* with alpha, for the surfaces (cui_box.surface) */
+    bool es;
     cui__egl_context context;
     cui__egl_surface surface;
 } cui__egl;
 
 #define CUI__WL_BAR 30          /* built-in title bar: height, and the width of a button, in points */
 #define CUI__WL_BORDER 8        /* invisible border to resize by, outside the window */
+#define CUI__WL_DRAG_STILL 0.25 /* seconds without a configure after which a drag has ended */
 #define CUI__WL_CORNER 20       /* this near a border's end, the corner is dragged */
 #define CUI__WL_OUTPUTS 8
 
@@ -129,6 +133,17 @@ typedef struct cui__wl {
     struct wl_callback *frame;      /* OpenGL: asked for with the last swap, not come yet */
     cui_x11_window gpu_window;      /* the window as cui_gpu_create takes it (Vulkan) */
     struct wl_egl_window *egl_window;
+    /* the surfaces (cui_box.surface), each a subsurface over the content with a picture of its own size */
+    struct {
+        struct wl_surface *surface;
+        struct wl_subsurface *sub;
+        struct wp_viewport *viewport;
+        struct wl_egl_window *window;
+        cui__egl_surface egl;
+        int x, y, w, h, order;   /* pixels from the window's top left */
+        bool live;          /* it holds a picture */
+    } zone[CUI_SURFACES];
+    bool zones_failed;      /* the driver would not draw to them: the frame is drawn as one list */
     cui__egl egl;
     int width, height;              /* content, points */
     int fb_w, fb_h;                 /* content, pixels */
@@ -137,7 +152,8 @@ typedef struct cui__wl {
     float scale;
     int normal_w, normal_h;         /* content size while neither maximized nor fullscreen */
     int pending_w, pending_h;       /* xdg_toplevel.configure, until xdg_surface.configure */
-    bool pending_maximized, pending_fullscreen, pending_tiled, pending_activated;
+    bool pending_maximized, pending_fullscreen, pending_tiled, pending_activated, pending_resizing, resizing;
+    double resized_at;              /* the last configure of a drag resize */
     bool configured, maximized, fullscreen, tiled, minimized;
     bool server_decoration;         /* the compositor draws the title bar */
     unsigned events;                /* counts the compositor's events that are news for the app (cui__wl_pump) */
@@ -1089,12 +1105,13 @@ static void cui__wl_toplevel_configure(void *data, struct xdg_toplevel *t, int32
     w->events++;
     (void)t;
     w->pending_w = width; w->pending_h = height;
-    w->pending_maximized = w->pending_fullscreen = w->pending_tiled = w->pending_activated = false;
+    w->pending_maximized = w->pending_fullscreen = w->pending_tiled = w->pending_activated = w->pending_resizing = false;
     const uint32_t *state;
     wl_array_for_each(state, states) {
         if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED) w->pending_maximized = true;
         else if (*state == XDG_TOPLEVEL_STATE_ACTIVATED) w->pending_activated = true;
         else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) w->pending_fullscreen = true;
+        else if (*state == XDG_TOPLEVEL_STATE_RESIZING) w->pending_resizing = true;
         else if (*state >= XDG_TOPLEVEL_STATE_TILED_LEFT && *state <= XDG_TOPLEVEL_STATE_TILED_BOTTOM) w->pending_tiled = true;
     }
 }
@@ -1112,6 +1129,8 @@ static void cui__wl_xdg_surface_configure(void *data, struct xdg_surface *xs, ui
     cui__wl *w = data;
     w->events++;
     w->maximized = w->pending_maximized; w->fullscreen = w->pending_fullscreen; w->tiled = w->pending_tiled;
+    w->resizing = w->pending_resizing;
+    if (w->resizing) w->resized_at = cui__plat_now();   /* GNOME 50 sends no configure as a drag ends */
     /* a compositor configures a window as it minimizes it too (it is no longer the active one):
      * the window is back when it is the active one again */
     if (w->pending_activated) w->minimized = false;
@@ -1384,7 +1403,7 @@ static bool cui__wl_egl_load(cui__egl *e) {
 #define CUI__EGL(name) (*(void **)&e->name = dlsym(e->lib, "egl" #name))
     CUI__EGL(GetDisplay); CUI__EGL(GetPlatformDisplay); CUI__EGL(Initialize); CUI__EGL(BindAPI); CUI__EGL(ChooseConfig);
     CUI__EGL(CreateContext); CUI__EGL(CreateWindowSurface); CUI__EGL(MakeCurrent); CUI__EGL(SwapBuffers); CUI__EGL(SwapInterval);
-    CUI__EGL(DestroySurface); CUI__EGL(DestroyContext); CUI__EGL(Terminate); CUI__EGL(GetProcAddress);
+    CUI__EGL(DestroySurface); CUI__EGL(DestroyContext); CUI__EGL(Terminate); CUI__EGL(GetProcAddress); CUI__EGL(QueryString);
 #undef CUI__EGL
     return e->GetDisplay && e->Initialize && e->BindAPI && e->ChooseConfig && e->CreateContext && e->CreateWindowSurface &&
            e->MakeCurrent && e->SwapBuffers && e->SwapInterval && e->DestroySurface && e->DestroyContext && e->Terminate &&
@@ -1404,9 +1423,14 @@ static bool cui__wl_egl_context(cui__wl *w, bool es) {
         int gl[] = { EGL_CONTEXT_MAJOR_VERSION_, 3, EGL_CONTEXT_MINOR_VERSION_, 3,
                      EGL_CONTEXT_OPENGL_PROFILE_MASK_, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_, EGL_NONE_ };
         int gles[] = { EGL_CONTEXT_MAJOR_VERSION_, 3, EGL_NONE_ };
-        e->context = e->CreateContext(e->display, e->config, NULL, es ? gles : gl);
+        /* tied to no config where the driver allows it, so that it can also draw to the surfaces
+         * of the surfaces, which have alpha and so another config */
+        const char *ext = e->QueryString ? e->QueryString(e->display, 0x3055 /* EGL_EXTENSIONS */) : NULL;
+        bool free_config = ext && strstr(ext, "EGL_KHR_no_config_context");
+        e->context = e->CreateContext(e->display, free_config ? NULL : e->config, NULL, es ? gles : gl);
     }
     if (!e->context) return false;
+    e->es = es;
     e->surface = e->CreateWindowSurface(e->display, e->config, w->egl_window, NULL);
     if (!e->surface || !e->MakeCurrent(e->display, e->surface, e->surface, e->context)) {
         if (e->surface) e->DestroySurface(e->display, e->surface);
@@ -1447,8 +1471,21 @@ void *cui__plat_gl_proc(const char *name) {
     return p;
 }
 
+static void cui__wl_zones_free(cui__wl *w) {
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        if (w->zone[i].egl && w->egl.display) w->egl.DestroySurface(w->egl.display, w->zone[i].egl);
+        if (w->zone[i].window) wl_egl_window_destroy(w->zone[i].window);
+        if (w->zone[i].viewport) wp_viewport_destroy(w->zone[i].viewport);
+        if (w->zone[i].sub) wl_subsurface_destroy(w->zone[i].sub);
+        if (w->zone[i].surface) wl_surface_destroy(w->zone[i].surface);
+        memset(&w->zone[i], 0, sizeof w->zone[i]);
+    }
+}
+
 void cui__plat_gl_release(cui_app *app) {
     cui__wl *w = cui__wl_of(app);
+    if (w->egl.display) w->egl.MakeCurrent(w->egl.display, NULL, NULL, NULL);
+    cui__wl_zones_free(w);
     cui__wl_egl_close(&w->egl);
     if (w->egl_window) wl_egl_window_destroy(w->egl_window);
     w->egl_window = NULL;
@@ -1475,7 +1512,7 @@ bool cui__plat_gpu_frame(cui_app *app, int width, int height) {
     cui__wl *w = cui__wl_of(app);
     if (!w->shown) return false;
     double start = cui__plat_now();
-    bool unpaced = app->desc.no_vsync || !w->gpu_seen;   /* until a callback came, none may come */
+    bool unpaced = app->desc.no_vsync || w->unpaced || !w->gpu_seen;   /* until a callback came, none may come */
     while (w->frame && app->running && !unpaced) {
         double left = 0.25 - (cui__plat_now() - start);
         if (left <= 0) break;
@@ -1630,3 +1667,125 @@ void cui__plat_placement(cui_app *app, cui_window_placement *out) {
     out->state = w->maximized ? CUI_WINDOW_MAXIMIZED : CUI_WINDOW_NORMAL;
 }
 
+/* ---- surfaces as subsurfaces ---- */
+
+/* Where a zone is, in the window's own units, and above which of the others: holds from the window's next commit. */
+static void cui__wl_zone_place(cui__wl *w, int slot) {
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    wl_subsurface_set_position(z->sub, z->x * 120 / w->scale120, z->y * 120 / w->scale120);
+    /* each above those of lower order, whatever order they were made in */
+    int sorted[CUI_SURFACES], n = 0;
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        if (!w->zone[i].sub || !w->zone[i].live) continue;
+        int k = n++;
+        while (k > 0 && w->zone[sorted[k - 1]].order > w->zone[i].order) { sorted[k] = sorted[k - 1]; k--; }
+        sorted[k] = i;
+    }
+    struct wl_surface *below = w->surface;
+    for (int k = 0; k < n; k++) {
+        wl_subsurface_place_above(w->zone[sorted[k]].sub, below);
+        below = w->zone[sorted[k]].surface;
+    }
+    (void)slot;
+}
+
+/* The subsurface of a slot for a renderer that makes its own pictures on it (Vulkan): made if there is none, sized,
+ * placed and stacked. NULL when there are no subsurfaces to be had. */
+bool cui__plat_live_resize(cui_app *app) {
+    cui__wl *w = cui__wl_of(app);
+    return w->resizing && cui__plat_now() - w->resized_at < CUI__WL_DRAG_STILL;
+}
+
+void *cui__plat_gpu_surface(cui_app *app, int slot, int x, int y, int fb_w, int fb_h, int order) {
+    cui__wl *w = cui__wl_of(app);
+    if (!w->subcompositor || !w->viewporter || slot < 0 || slot >= CUI_SURFACES || fb_w < 1 || fb_h < 1) return NULL;
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    if (!z->surface) {
+        z->surface = cui__wl_child(w, &z->sub, &z->viewport);
+        struct wl_region *none = wl_compositor_create_region(w->compositor);   /* the pointer goes through to the window */
+        wl_surface_set_input_region(z->surface, none);
+        wl_region_destroy(none);
+        z->x = z->y = z->order = -1;
+    }
+    if (!z->viewport) return NULL;   /* (the renderer's buffers are larger than the surface: the viewport crops) */
+    wl_surface_set_buffer_scale(z->surface, 1);
+    wp_viewport_set_source(z->viewport, 0, 0, wl_fixed_from_int(fb_w), wl_fixed_from_int(fb_h));
+    wp_viewport_set_destination(z->viewport, CUI_MAX(1, fb_w * 120 / w->scale120), CUI_MAX(1, fb_h * 120 / w->scale120));
+    bool moved = !z->live || z->x != x || z->y != y || z->order != order;
+    z->x = x; z->y = y; z->w = fb_w; z->h = fb_h; z->order = order;
+    z->live = true;
+    if (moved) { cui__wl_zone_place(w, slot); wl_surface_commit(w->surface); }
+    return z->surface;
+}
+
+bool cui__plat_surface_begin(cui_app *app, int slot, int x, int y, int fb_w, int fb_h, int order) {
+    cui__wl *w = cui__wl_of(app);
+    cui__egl *e = &w->egl;
+    if (w->zones_failed || !e->context || !w->subcompositor || slot < 0 || slot >= CUI_SURFACES || fb_w < 1 || fb_h < 1) return false;
+    if (!e->layer_config) {
+        int attrs[] = { EGL_SURFACE_TYPE_, EGL_WINDOW_BIT_, EGL_RENDERABLE_TYPE_, e->es ? EGL_OPENGL_ES3_BIT_ : EGL_OPENGL_BIT_,
+                        EGL_RED_SIZE_, 8, EGL_GREEN_SIZE_, 8, EGL_BLUE_SIZE_, 8, EGL_ALPHA_SIZE_, 8, EGL_NONE_ };
+        int count = 0;
+        if (!e->ChooseConfig(e->display, attrs, &e->layer_config, 1, &count) || count < 1) { e->layer_config = NULL; w->zones_failed = true; return false; }
+    }
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    if (!z->surface) {
+        z->surface = cui__wl_child(w, &z->sub, &z->viewport);
+        struct wl_region *none = wl_compositor_create_region(w->compositor);   /* the pointer goes through to the window */
+        wl_surface_set_input_region(z->surface, none);
+        wl_region_destroy(none);
+        z->window = wl_egl_window_create(z->surface, fb_w, fb_h);
+        z->egl = z->window ? e->CreateWindowSurface(e->display, e->layer_config, z->window, NULL) : NULL;
+        z->w = fb_w; z->h = fb_h;
+        z->x = z->y = z->order = -1;
+    }
+    if (z->egl && (z->w != fb_w || z->h != fb_h)) {
+        wl_egl_window_resize(z->window, fb_w, fb_h, 0, 0);
+        z->w = fb_w; z->h = fb_h;
+    }
+    if (!z->egl || !e->MakeCurrent(e->display, z->egl, z->egl, e->context)) {
+        /* (a driver that ties a context to its config: no surface with alpha for it) */
+        e->MakeCurrent(e->display, e->surface, e->surface, e->context);
+        cui__wl_zones_free(w);
+        w->zones_failed = true;
+        return false;
+    }
+    e->SwapInterval(e->display, 0);
+    if (!z->viewport) return NULL;   /* (the renderer's buffers are larger than the surface: the viewport crops) */
+    wl_surface_set_buffer_scale(z->surface, 1);
+    wp_viewport_set_source(z->viewport, 0, 0, wl_fixed_from_int(fb_w), wl_fixed_from_int(fb_h));
+    wp_viewport_set_destination(z->viewport, CUI_MAX(1, fb_w * 120 / w->scale120), CUI_MAX(1, fb_h * 120 / w->scale120));
+    bool moved = !z->live || z->x != x || z->y != y || z->order != order;
+    z->x = x; z->y = y; z->order = order;
+    z->live = true;
+    if (moved) cui__wl_zone_place(w, slot);
+    return true;
+}
+
+void cui__plat_surface_end(cui_app *app, int slot) {
+    cui__wl *w = cui__wl_of(app);
+    cui__egl *e = &w->egl;
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    if (!z->egl) return;
+    e->SwapBuffers(e->display, z->egl);
+    wl_surface_commit(w->surface);   /* where it is and above what holds from the window's commit; a commit with nothing else in it costs nothing */
+    e->MakeCurrent(e->display, e->surface, e->surface, e->context);
+}
+
+void cui__plat_surface_move(cui_app *app, int slot, int x, int y, int order) {
+    cui__wl *w = cui__wl_of(app);
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    if (!z->sub || !z->live) return;
+    z->x = x; z->y = y; z->order = order;
+    cui__wl_zone_place(w, slot);
+    wl_surface_commit(w->surface);
+}
+
+void cui__plat_surface_hide(cui_app *app, int slot) {
+    cui__wl *w = cui__wl_of(app);
+    __typeof__(w->zone[0]) *z = &w->zone[slot];
+    if (!z->surface) return;
+    z->live = false;
+    wl_surface_attach(z->surface, NULL, 0, 0);
+    wl_surface_commit(z->surface);
+}

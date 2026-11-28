@@ -247,6 +247,8 @@ static void cui__mac_wake(void) {
     cui_request_redraw(self.app->ui);
     if (self.window.inLiveResize) cui__app_live_frame(self.app);
 }
+- (void)windowWillStartLiveResize:(NSNotification *)n { (void)n; self.app->live_resize = true; }
+- (void)windowDidEndLiveResize:(NSNotification *)n { (void)n; self.app->live_resize = false; cui_request_redraw(self.app->ui); }
 - (void)windowDidChangeBackingProperties:(NSNotification *)n { (void)n; if (self.gl) [self.gl update]; cui_request_redraw(self.app->ui); }
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; cui_input_focus(self.app->ui, true); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; cui_input_focus(self.app->ui, false); }
@@ -544,3 +546,9 @@ void cui__plat_maximize(cui_app *app) {
     if (!p.window.isZoomed)
         [p.window zoom:nil];
 }
+
+/* no surfaces of the system's here yet: the frame is drawn as one list */
+bool cui__plat_surface_begin(cui_app *app, int slot, int x, int y, int w, int h, int order) { (void)app; (void)slot; (void)x; (void)y; (void)w; (void)h; (void)order; return false; }
+void cui__plat_surface_end(cui_app *app, int slot) { (void)app; (void)slot; }
+void cui__plat_surface_move(cui_app *app, int slot, int x, int y, int order) { (void)app; (void)slot; (void)x; (void)y; (void)order; }
+void cui__plat_surface_hide(cui_app *app, int slot) { (void)app; (void)slot; }

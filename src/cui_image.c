@@ -61,12 +61,27 @@ cui_texture cui_image_load(cui_ctx *ui, const char *path, int *w, int *h) {
     if (h) *h = ih;
     return t;
 }
+
+cui_texture cui_image_load_memory(cui_ctx *ui, const void *data, size_t size, int *w, int *h) {
+    int iw = 0, ih = 0, comp = 0;
+    unsigned char *px = size <= INT_MAX ? stbi_load_from_memory((const stbi_uc *)data, (int)size, &iw, &ih, &comp, 4) : NULL;
+    if (!px) return 0;
+    cui_texture t = cui_image_create(ui, iw, ih, px);
+    stbi_image_free(px);
+    if (w) *w = iw;
+    if (h) *h = ih;
+    return t;
+}
 #else
 unsigned char *cui__png_decode(const unsigned char *data, int len, int *w, int *h) { (void)data; (void)len; (void)w; (void)h; return NULL; }
 void cui__png_free(unsigned char *px) { (void)px; }
 /** Report that loading is unavailable in builds without the bundled decoder. */
 cui_texture cui_image_load(cui_ctx *ui, const char *path, int *w, int *h) {
     (void)ui; (void)path; (void)w; (void)h;
+    return 0;
+}
+cui_texture cui_image_load_memory(cui_ctx *ui, const void *data, size_t size, int *w, int *h) {
+    (void)ui; (void)data; (void)size; (void)w; (void)h;
     return 0;
 }
 #endif

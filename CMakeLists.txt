@@ -88,7 +88,9 @@ set(CUI_CORE_SOURCES
     src/cui_terminal.c
     src/cui_emoji.c
     src/render/cui_render_sw.c
-    src/render/cui_render_gl.c)
+    src/render/cui_render_gl.c
+    src/render/cui_damage.c
+    src/render/cui_pool.c)
 
 if(CUI_DEFAULT_FONTS)
     list(APPEND CUI_CORE_SOURCES src/cui_font_data.c src/cui_inflate.c)
@@ -289,7 +291,7 @@ endif()
 if(CUI_D3D12)
     target_sources(cui PRIVATE src/render/cui_render_d3d12.c)
     target_compile_definitions(cui PUBLIC CUI_D3D12)
-    target_link_libraries(cui PUBLIC d3d12 dxgi d3dcompiler dxguid)
+    target_link_libraries(cui PUBLIC d3d12 dxgi d3dcompiler dxguid dcomp)
 endif()
 if(CUI_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "CUI_VULKAN is for Linux")
@@ -302,6 +304,11 @@ if(CUI_VULKAN)
     target_link_libraries(cui PUBLIC Vulkan::Vulkan)
     if(CUI_PLATFORM STREQUAL "wayland")   # a Wayland surface, also without the window layer: no X11
         target_compile_definitions(cui PRIVATE CUI_WAYLAND)
+        if(NOT CUI_WITH_APP)   # the renderer's own subsurfaces need wayland-client
+            find_package(PkgConfig REQUIRED)
+            pkg_check_modules(CUI_WL_CLIENT REQUIRED wayland-client)
+            target_include_directories(cui PRIVATE ${CUI_WL_CLIENT_INCLUDE_DIRS})
+        endif()
     else()
         find_package(X11 REQUIRED)
         target_include_directories(cui PRIVATE ${X11_INCLUDE_DIR})
@@ -317,7 +324,7 @@ if(CUI_METAL)
     target_sources(cui PRIVATE src/render/cui_render_metal.m)
     set_source_files_properties(src/render/cui_render_metal.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     target_compile_definitions(cui PUBLIC CUI_METAL)
-    target_link_libraries(cui PUBLIC "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+    target_link_libraries(cui PUBLIC "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework IOSurface")
 endif()
 
 # A minor release adds fields to option and description structs, which changes their size, so a
@@ -373,7 +380,7 @@ elseif(CUI_BACKEND STREQUAL "win32")
 endif()
 # the GPU renderer's libraries, for a static link
 if(CUI_D3D12)
-    set(CUI_PC_LIBS "${CUI_PC_LIBS} -ld3d12 -ldxgi -ld3dcompiler -ldxguid")
+    set(CUI_PC_LIBS "${CUI_PC_LIBS} -ld3d12 -ldxgi -ld3dcompiler -ldxguid -ldcomp")
 endif()
 if(CUI_VULKAN)
     set(CUI_PC_LIBS "${CUI_PC_LIBS} -lvulkan")
@@ -382,7 +389,7 @@ if(CUI_VULKAN)
     endif()
 endif()
 if(CUI_METAL)
-    set(CUI_PC_LIBS "${CUI_PC_LIBS} -framework Metal")
+    set(CUI_PC_LIBS "${CUI_PC_LIBS} -framework Metal -framework IOSurface")
     if(NOT CUI_BACKEND STREQUAL "cocoa")
         set(CUI_PC_LIBS "${CUI_PC_LIBS} -framework Cocoa -framework QuartzCore")
     endif()

@@ -26,8 +26,189 @@ static cui_draw_cmd *cui__cmd_of(cui_ctx *ui, bool instanced) {
 
 static cui_draw_cmd *cui__cmd(cui_ctx *ui) { return cui__cmd_of(ui, false); }
 
+/* ---- surfaces: zones of the window with a draw list of their own ---- */
+
+static cui_draw_buf cui__buf_of(const cui_draw_list *dl) {
+    cui_draw_buf b = { dl->vtx, dl->vtx_count, dl->vtx_cap, dl->idx, dl->idx_count, dl->idx_cap,
+                       dl->cmd, dl->cmd_count, dl->cmd_cap, dl->inst, dl->inst_count, dl->inst_cap };
+    return b;
+}
+
+/* Makes buffer `to` (0: the window, 1 + slot: a surface) the one shapes go into. */
+static void cui__use_buf(cui_ctx *ui, int to) {
+    if (to == ui->dbuf) return;
+    cui_draw_list *dl = &ui->dl;
+    ui->dbufs[ui->dbuf] = cui__buf_of(dl);
+    cui_draw_buf b = ui->dbufs[to];
+    dl->vtx = b.vtx; dl->vtx_count = b.vtx_count; dl->vtx_cap = b.vtx_cap;
+    dl->idx = b.idx; dl->idx_count = b.idx_count; dl->idx_cap = b.idx_cap;
+    dl->cmd = b.cmd; dl->cmd_count = b.cmd_count; dl->cmd_cap = b.cmd_cap;
+    dl->inst = b.inst; dl->inst_count = b.inst_count; dl->inst_cap = b.inst_cap;
+    ui->dbuf = to;
+}
+
+void cui__surface_push(cui_ctx *ui, cui_id id, cui_rect r) {
+    if (ui->dbuf_depth >= CUI_COUNTOF(ui->dbuf_stack)) return;
+    /* whole points, so that a system that places surfaces in points puts it where it was drawn */
+    float x0 = floorf(r.x), y0 = floorf(r.y), x1 = ceilf(r.x + r.w), y1 = ceilf(r.y + r.h);
+    x0 = CUI_MAX(x0, 0); y0 = CUI_MAX(y0, 0); x1 = CUI_MIN(x1, ceilf(ui->vw)); y1 = CUI_MIN(y1, ceilf(ui->vh));
+    int slot = -1, same = 0;
+    for (int i = 0; i < CUI_SURFACES; i++) same += ui->surf[i].used && ui->surf[i].base == id;
+    cui_id base = id;
+    if (same && id) { uint32_t key[2] = { id, (uint32_t)same }; id = cui__hash(key, sizeof key, 0x5f3759df); }   /* the same id again this frame: another surface, the same one every frame */
+    for (int i = 0; i < CUI_SURFACES && id; i++) if (ui->surf[i].id == id) { slot = i; break; }
+    for (int i = 0; i < CUI_SURFACES && slot < 0 && id; i++) if (!ui->surf[i].id) slot = i;
+    if (x1 <= x0 || y1 <= y0) slot = -1;
+    ui->dbuf_stack[ui->dbuf_depth++] = ui->dbuf;
+    cui_rect zone = { x0, y0, x1 - x0, y1 - y0 };
+    cui_push_clip(ui, slot < 0 ? r : zone);
+    if (slot < 0) return;   /* no room for another, or nothing of it in the window: drawn where it is */
+    cui__surface *sf = &ui->surf[slot];
+    float s = ui->scale;
+    sf->id = id; sf->base = base; sf->used = true; sf->order = ui->surf_order++;
+    sf->x = (int)(x0 * s + 0.5f); sf->y = (int)(y0 * s + 0.5f);
+    sf->w = (int)(x1 * s + 0.5f) - sf->x; sf->h = (int)(y1 * s + 0.5f) - sf->y;
+    cui__use_buf(ui, 1 + slot);
+}
+
+void cui__surface_pop(cui_ctx *ui) {
+    if (ui->dbuf_depth <= 0) return;
+    cui_pop_clip(ui);
+    cui__use_buf(ui, ui->dbuf_stack[--ui->dbuf_depth]);
+}
+
+void cui_surface_begin(cui_ctx *ui, const char *id, cui_rect rect) { cui__surface_push(ui, cui__hash_str(id, 0x5f3759df), rect); }
+void cui_surface_end(cui_ctx *ui) { cui__surface_pop(ui); }
+
+bool cui_get_surface(cui_ctx *ui, int slot, cui_surface *out) {
+    if (slot < 0 || slot >= CUI_SURFACES || !ui->surf[slot].used) return false;
+    const cui__surface *sf = &ui->surf[slot];
+    if (out) { out->id = sf->id; out->x = sf->x; out->y = sf->y; out->w = sf->w; out->h = sf->h; out->order = sf->order; out->draw = &ui->surf_data[slot]; }
+    return true;
+}
+
+const cui_draw_data *cui_get_draw_data(cui_ctx *ui) { return &ui->draw_data; }
+
+static void cui__data_of(cui_draw_data *dd, const cui_draw_buf *b) {
+    dd->vertices = b->vtx; dd->vertex_count = b->vtx_count;
+    dd->indices = b->idx; dd->index_count = b->idx_count;
+    dd->commands = b->cmd; dd->command_count = b->cmd_count;
+    dd->instances = b->inst; dd->instance_count = b->inst_count;
+}
+
+void cui__draw_finish(cui_ctx *ui) {
+    cui__use_buf(ui, 0);
+    ui->dbuf_depth = 0;
+    ui->dbufs[0] = cui__buf_of(&ui->dl);
+    cui_draw_data base;
+    memset(&base, 0, sizeof base);
+    base.width_px = (int)(ui->vw * ui->scale + 0.5f);
+    base.height_px = (int)(ui->vh * ui->scale + 0.5f);
+    base.clear_color = ui->theme.colors[CUI_TOKEN_BACKGROUND];
+    base.font_atlas = ui->atlas_tex;
+    ui->draw_data = base;
+    cui__data_of(&ui->draw_data, &ui->dbufs[0]);
+    /* the surfaces in the order they were begun in: the order they lie over the window in */
+    int order[CUI_SURFACES], count = 0;
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        memset(&ui->surf_data[i], 0, sizeof ui->surf_data[i]);
+        if (!ui->surf[i].used) { ui->surf[i].id = 0; continue; }   /* a surface that was not drawn into gives its slot up */
+        int k = count++;
+        while (k > 0 && ui->surf[order[k - 1]].order > ui->surf[i].order) { order[k] = order[k - 1]; k--; }
+        order[k] = i;
+    }
+    ui->flat_stale = count > 0;
+    ui->merged_data = ui->draw_data;
+    /* each surface's own list, from its own top left corner: what is drawn into a target of its size */
+    for (int n = 0; n < count; n++) {
+        const cui__surface *sf = &ui->surf[order[n]];
+        cui_draw_buf *b = &ui->dbufs[1 + order[n]];
+        float ox = (float)sf->x, oy = (float)sf->y;
+        for (int k = 0; k < b->vtx_count; k++) { b->vtx[k].x -= ox; b->vtx[k].y -= oy; }
+        for (int k = 0; k < b->inst_count; k++) {
+            cui_instance *in = &b->inst[k];
+            in->x0 = (int16_t)(in->x0 - sf->x * 4); in->x1 = (int16_t)(in->x1 - sf->x * 4);
+            in->y0 = (int16_t)(in->y0 - sf->y * 4); in->y1 = (int16_t)(in->y1 - sf->y * 4);
+        }
+        cui_rect whole = { 0, 0, (float)sf->w, (float)sf->h };
+        for (int k = 0; k < b->cmd_count; k++) {
+            b->cmd[k].clip.x -= ox; b->cmd[k].clip.y -= oy;
+            b->cmd[k].clip = cui__rect_intersect(b->cmd[k].clip, whole);
+        }
+        cui_draw_data *dd = &ui->surf_data[order[n]];
+        *dd = base;
+        dd->width_px = sf->w; dd->height_px = sf->h;
+        cui_color none = { 0, 0, 0, 0 };
+        dd->clear_color = none;   /* clear where nothing is drawn: the window shows through */
+        cui__data_of(dd, b);
+    }
+}
+
+/* The window's list and every surface's as one list for one target: each surface's shapes put back
+ * where the surface lies, in the order the surfaces lie over the window in. A copy of the frame:
+ * for a renderer that has not learnt to take the lists one after another (cui_gl_render_lists). */
+const cui_draw_data *cui__draw_data_merged(cui_ctx *ui) {
+    if (!ui->flat_stale) return &ui->merged_data;
+    ui->flat_stale = false;
+    int order[CUI_SURFACES], count = 0, nv = ui->dbufs[0].vtx_count, ni = ui->dbufs[0].idx_count, nc = ui->dbufs[0].cmd_count, nr = ui->dbufs[0].inst_count;
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        if (!ui->surf[i].used) continue;
+        int k = count++;
+        while (k > 0 && ui->surf[order[k - 1]].order > ui->surf[i].order) { order[k] = order[k - 1]; k--; }
+        order[k] = i;
+        const cui_draw_buf *b = &ui->dbufs[1 + i];
+        nv += b->vtx_count; ni += b->idx_count; nc += b->cmd_count; nr += b->inst_count;
+    }
+    cui_draw_buf *f = &ui->flat;
+    f->vtx_count = f->idx_count = f->cmd_count = f->inst_count = 0;
+    CUI__GROW(ui, f->vtx, f->vtx_count, f->vtx_cap, nv);
+    CUI__GROW(ui, f->idx, f->idx_count, f->idx_cap, ni);
+    CUI__GROW(ui, f->cmd, f->cmd_count, f->cmd_cap, nc);
+    CUI__GROW(ui, f->inst, f->inst_count, f->inst_cap, nr);
+    for (int n = 0; n <= count; n++) {
+        const cui_draw_buf *b = &ui->dbufs[n ? 1 + order[n - 1] : 0];
+        int sx = n ? ui->surf[order[n - 1]].x : 0, sy = n ? ui->surf[order[n - 1]].y : 0;
+        if (b->vtx_count) memcpy(f->vtx + f->vtx_count, b->vtx, sizeof *b->vtx * (size_t)b->vtx_count);
+        if (b->inst_count) memcpy(f->inst + f->inst_count, b->inst, sizeof *b->inst * (size_t)b->inst_count);
+        for (int k = 0; (sx || sy) && k < b->vtx_count; k++) { f->vtx[f->vtx_count + k].x += (float)sx; f->vtx[f->vtx_count + k].y += (float)sy; }
+        for (int k = 0; (sx || sy) && k < b->inst_count; k++) {
+            cui_instance *in = &f->inst[f->inst_count + k];
+            in->x0 = (int16_t)(in->x0 + sx * 4); in->x1 = (int16_t)(in->x1 + sx * 4);
+            in->y0 = (int16_t)(in->y0 + sy * 4); in->y1 = (int16_t)(in->y1 + sy * 4);
+        }
+        for (int k = 0; k < b->idx_count; k++) f->idx[f->idx_count + k] = b->idx[k] + (uint32_t)f->vtx_count;
+        for (int k = 0; k < b->cmd_count; k++) {
+            cui_draw_cmd c = b->cmd[k];
+            c.clip.x += (float)sx; c.clip.y += (float)sy;
+            c.index_offset += (uint32_t)f->idx_count;
+            c.instance_offset += (uint32_t)f->inst_count;
+            f->cmd[f->cmd_count + k] = c;
+        }
+        f->vtx_count += b->vtx_count; f->idx_count += b->idx_count; f->cmd_count += b->cmd_count; f->inst_count += b->inst_count;
+    }
+    cui__data_of(&ui->merged_data, f);
+    return &ui->merged_data;
+}
+
+void cui__draw_free(cui_ctx *ui) {
+    cui__use_buf(ui, 0);
+    ui->dbufs[0] = cui__buf_of(&ui->dl);
+    for (int i = 0; i < 1 + CUI_SURFACES; i++) {
+        cui__free(ui, ui->dbufs[i].vtx); cui__free(ui, ui->dbufs[i].idx);
+        cui__free(ui, ui->dbufs[i].cmd); cui__free(ui, ui->dbufs[i].inst);
+    }
+    cui__free(ui, ui->flat.vtx); cui__free(ui, ui->flat.idx); cui__free(ui, ui->flat.cmd); cui__free(ui, ui->flat.inst);
+}
+
 void cui__draw_reset(cui_ctx *ui) {
     cui_draw_list *dl = &ui->dl;
+    cui__use_buf(ui, 0);
+    ui->dbuf_depth = 0;
+    ui->surf_order = 0;
+    for (int i = 0; i < CUI_SURFACES; i++) {
+        ui->surf[i].used = false;
+        ui->dbufs[1 + i].vtx_count = ui->dbufs[1 + i].idx_count = ui->dbufs[1 + i].cmd_count = ui->dbufs[1 + i].inst_count = 0;
+    }
     dl->vtx_count = dl->idx_count = dl->cmd_count = dl->inst_count = 0;
     dl->clip_depth = 1;
     cui_rect full = { 0, 0, ui->vw * ui->scale, ui->vh * ui->scale };
@@ -150,6 +331,15 @@ static bool cui__pack(cui__packed *p, float x0, float y0, float x1, float y1, fl
     return ok && cui__quarter(param, 0, 65535, &p->param) && p->x1 > p->x0 && p->y1 > p->y0;
 }
 
+/* The lean of a quad whose bottom edge is at y, while the draw list shears (cui_draw_list.shear):
+ * the record's shear in 128ths, and how far its bottom edge moves. 0 and no move otherwise. */
+static int cui__shear_of(cui_ctx *ui, float bottom, float *dx) {
+    int q = (int)lroundf(ui->dl.shear * 128.0f);
+    q = CUI_CLAMP(q, -127, 127);
+    *dx = (float)q / 128.0f * (ui->dl.shear_base - bottom);
+    return q;
+}
+
 static void cui__emit_instance(cui_ctx *ui, const cui__packed *p, int mode, cui_color top, cui_color bottom, cui_color border) {
     cui_instance *in = cui__reserve_instance(ui);
     in->x0 = (int16_t)p->x0; in->y0 = (int16_t)p->y0; in->x1 = (int16_t)p->x1; in->y1 = (int16_t)p->y1;
@@ -162,6 +352,24 @@ static void cui__emit_instance(cui_ctx *ui, const cui__packed *p, int mode, cui_
 
 void cui_instance_vertices(const cui_instance *in, cui_vertex v[4]) {
     float x0 = in->x0 * 0.25f, y0 = in->y0 * 0.25f, x1 = in->x1 * 0.25f, y1 = in->y1 * 0.25f;
+    if (in->mode == CUI_SHADE_LINE) {
+        /* a box along the stroke: its length by its thickness, a pixel wider all round for the soft edge */
+        float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
+        if (len > 0) { dx /= len; dy /= len; } else { dx = 1; dy = 0; }
+        float r = in->r_tl * 0.25f;   /* round ends reach past the two points by their radius */
+        float hl = len * 0.5f + r, ht = CUI_MAX(in->param * 0.125f, 0.5f), mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
+        memset(v, 0, sizeof(cui_vertex) * 4);
+        for (int i = 0; i < 4; i++) {
+            float lx = (i == 1 || i == 2 ? 1.0f : -1.0f) * (hl + 1.0f), ly = (i >= 2 ? 1.0f : -1.0f) * (ht + 1.0f);
+            v[i].x = mx + dx * lx - dy * ly; v[i].y = my + dy * lx + dx * ly;
+            v[i].lx = lx; v[i].ly = ly; v[i].hw = hl; v[i].hh = ht;
+            v[i].r_tl = v[i].r_tr = v[i].r_br = v[i].r_bl = r;
+            v[i].mode = (float)CUI_SHADE_RRECT;
+            v[i].color = in->color_top;
+            v[i].border_color = in->border_color;
+        }
+        return;
+    }
     float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f, hw = (x1 - x0) * 0.5f, hh = (y1 - y0) * 0.5f;
     float param = in->param * 0.25f;
     float pad = in->mode == CUI_SHADE_SHADOW ? param * 3.0f : (in->mode == CUI_SHADE_RRECT || in->mode == CUI_SHADE_IMAGE) ? 1.0f : 0.0f;
@@ -169,7 +377,7 @@ void cui_instance_vertices(const cui_instance *in, cui_vertex v[4]) {
     float px[4] = { x0 - pad, x1 + pad, x1 + pad, x0 - pad }, py[4] = { y0 - pad, y0 - pad, y1 + pad, y1 + pad };
     memset(v, 0, sizeof(cui_vertex) * 4);
     for (int i = 0; i < 4; i++) {
-        v[i].x = px[i]; v[i].y = py[i];
+        v[i].x = px[i] + in->shear / 128.0f * (y1 - py[i]); v[i].y = py[i];
         v[i].lx = px[i] - cx; v[i].ly = py[i] - cy;
         v[i].hw = hw; v[i].hh = hh;
         v[i].u = u0 + (v[i].lx + hw) / (2 * hw) * (u1 - u0);
@@ -184,7 +392,9 @@ void cui_instance_vertices(const cui_instance *in, cui_vertex v[4]) {
 
 const cui_draw_data *cui_expand_instances(cui_expanded *e, const cui_draw_data *dd) {
     if (!dd || dd->instance_count <= 0) return dd;
-    int nv = dd->vertex_count + dd->instance_count * 4, ni = dd->index_count + dd->instance_count * 6;
+    uint32_t drawn = 0;   /* a list cut to several boxes (cui_damage_clip_boxes) draws a record once for each box it touches */
+    for (int i = 0; i < dd->command_count; i++) drawn += dd->commands[i].instance_count;
+    int nv = dd->vertex_count + (int)drawn * 4, ni = dd->index_count + (int)drawn * 6;
     if (nv > e->vertex_cap) { cui_vertex *p = realloc(e->vertices, sizeof *p * (size_t)nv); if (!p) return NULL; e->vertices = p; e->vertex_cap = nv; }
     if (ni > e->index_cap) { uint32_t *p = realloc(e->indices, sizeof *p * (size_t)ni); if (!p) return NULL; e->indices = p; e->index_cap = ni; }
     if (dd->command_count > e->command_cap) {
@@ -239,13 +449,16 @@ static void cui__sdf_quad(cui_ctx *ui, float cx, float cy, float hw, float hh, f
     float a = x.alpha;
     cui__set_texture(ui, tex);
     float maxr = CUI_MIN(nhw, nhh);
-    if (ui->dl.instanced && !ui->dl.vertices_only && cui__same_color(c_tl, c_tr) && cui__same_color(c_bl, c_br)) {
+    if (ui->dl.instanced && cui__same_color(c_tl, c_tr) && cui__same_color(c_bl, c_br)) {
         bool shadow = mode == CUI_SHADE_SHADOW;
         float r[4] = { rad.tl * s, rad.tr * s, rad.br * s, rad.bl * s };
         for (int i = 0; i < 4 && !shadow; i++) r[i] = CUI_MIN(r[i], maxr);
         cui__packed p;
-        if (cui__pack(&p, ncx - nhw, ncy - nhh, ncx + nhw, ncy + nhh, u0, v0, u1, v1, r, border * s)) {
+        float lean;
+        int shear = cui__shear_of(ui, ncy + nhh, &lean);
+        if (cui__pack(&p, ncx - nhw + lean, ncy - nhh, ncx + nhw + lean, ncy + nhh, u0, v0, u1, v1, r, border * s)) {
             cui__emit_instance(ui, &p, mode, cui__xa(c_tl, a), cui__xa(c_bl, a), cui__xa(bc, a));
+            ui->dl.inst[ui->dl.inst_count - 1].shear = (int8_t)shear;
             return;
         }
     }
@@ -351,14 +564,17 @@ void cui__draw_glyph_quad(cui_ctx *ui, float x0, float y0, float x1, float y1,
     }
     if (cui__clip_rejects(ui, x0, y0, x1, y1)) return;
     cui__set_texture(ui, 0);
-    if (ui->dl.instanced && !ui->dl.vertices_only) {
+    if (ui->dl.instanced) {
         static const float square[4] = { 0, 0, 0, 0 };
         cui__packed p;
+        float lean;
+        int shear = cui__shear_of(ui, y1, &lean);
         /* the size is kept exact, so a glyph is not resampled when its origin lands between quarter pixels */
-        if (cui__pack(&p, x0, y0, x1, y1, u0, v0, u1, v1, square, 0) && cui__quarter(x1 - x0, 1, 65535, &p.x1) && cui__quarter(y1 - y0, 1, 65535, &p.y1)) {
+        if (cui__pack(&p, x0 + lean, y0, x1 + lean, y1, u0, v0, u1, v1, square, 0) && cui__quarter(x1 - x0, 1, 65535, &p.x1) && cui__quarter(y1 - y0, 1, 65535, &p.y1)) {
             p.x1 += p.x0; p.y1 += p.y0;
             if (p.x1 <= 32767 && p.y1 <= 32767) {
                 cui__emit_instance(ui, &p, CUI_SHADE_TEXT, c, c, c);
+                ui->dl.inst[ui->dl.inst_count - 1].shear = (int8_t)shear;
                 return;
             }
         }
@@ -389,6 +605,35 @@ static void cui__polyline_px(cui_ctx *ui, const cui_vec2 *pts, int n, float thic
     float hw = thick * 0.5f;
     bool thin = hw < 0.5f;
     if (thin) { col.a = (uint8_t)(col.a * (thick > 0 ? thick : 1)); hw = 0.5f; }
+    /* (the vertices below fade over a pixel outside the stroke; a record's edge is in the middle of that pixel)
+     * As records: one stroke a segment. Two points make one with square ends, as the vertices
+     * below do. More points take round ends, which fill the joints, and so only at full opacity:
+     * a translucent stroke would be twice as dense where two of them overlap. */
+    if (ui->dl.instanced && ((n == 2 && !closed) || col.a == 255)) {
+        int first = ui->dl.inst_count;
+        bool ok = true;
+        for (int i = 0; i < segs && ok; i++) {
+            int j = (i + 1) % n, ax, ay, bx, by, t, r;
+            ok = cui__quarter(pts[i].x, -32768, 32767, &ax) && cui__quarter(pts[i].y, -32768, 32767, &ay) &&
+                 cui__quarter(pts[j].x, -32768, 32767, &bx) && cui__quarter(pts[j].y, -32768, 32767, &by) &&
+                 cui__quarter(hw * 2.0f + aa, 1, 65535, &t) && cui__quarter(n == 2 ? 0.0f : hw + aa * 0.5f, 0, 65535, &r);
+            if (!ok || (ax == bx && ay == by)) continue;
+            cui_instance *in = cui__reserve_instance(ui);
+            in->x0 = (int16_t)ax; in->y0 = (int16_t)ay; in->x1 = (int16_t)bx; in->y1 = (int16_t)by;
+            in->param = (uint16_t)t;
+            in->r_tl = (uint16_t)r;
+            in->mode = CUI_SHADE_LINE;
+            in->color_top = in->color_bottom = col;
+        }
+        if (ok) return;
+        /* one end did not fit: the whole line goes as vertices */
+        for (int c = 0; c < ui->dl.cmd_count; c++) {
+            cui_draw_cmd *dc = &ui->dl.cmd[c];
+            uint32_t end = dc->instance_offset + dc->instance_count;
+            if (end > (uint32_t)first) dc->instance_count = dc->instance_offset >= (uint32_t)first ? 0 : (uint32_t)first - dc->instance_offset;
+        }
+        ui->dl.inst_count = first;
+    }
     cui_color trans = col; trans.a = 0;
     /* normals per point */
     cui_vec2 *nrm = cui__frame_alloc(ui, sizeof(cui_vec2) * (size_t)n);

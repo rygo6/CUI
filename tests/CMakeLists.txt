@@ -46,6 +46,27 @@ if(CUI_TEXT_SHAPING)
 endif()
 add_test(NAME cui_test_dither COMMAND cui_test_dither)
 
+add_executable(cui_test_surfaces test_surfaces.c)
+target_link_libraries(cui_test_surfaces PRIVATE cui::cui)
+add_test(NAME cui_test_surfaces COMMAND cui_test_surfaces)
+
+# The GPU renderers' buffer pool, its bookkeeping alone (a build without one of them compiles it into the test)
+add_executable(cui_test_pool test_pool.c)
+target_link_libraries(cui_test_pool PRIVATE cui::cui)
+if(NOT (CUI_VULKAN OR CUI_D3D12 OR CUI_METAL))
+    target_sources(cui_test_pool PRIVATE ../src/render/cui_pool.c)
+    target_compile_definitions(cui_test_pool PRIVATE CUI_POOL_ALONE)
+endif()
+add_test(NAME cui_test_pool COMMAND cui_test_pool)
+
+# One window used the ways a window is used: what damage tracking redraws against the frame drawn whole, and with --window what each use costs
+add_executable(cui_test_dirty_rect test_dirty_rect.c)
+target_link_libraries(cui_test_dirty_rect PRIVATE cui::cui)
+if(CUI_WITH_APP)
+    target_compile_definitions(cui_test_dirty_rect PRIVATE CUI_TEST_WINDOW)
+endif()
+add_test(NAME cui_test_dirty_rect COMMAND cui_test_dirty_rect)
+
 add_executable(cui_screenshots screenshots.c ../examples/gallery_ui.c ../examples/gallery_more.c)
 target_link_libraries(cui_screenshots PRIVATE cui::cui)
 add_test(NAME cui_screenshots COMMAND cui_screenshots ${CMAKE_CURRENT_BINARY_DIR})

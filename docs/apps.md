@@ -39,7 +39,8 @@ cui_app_destroy(app);
 | `continuous` | Draw every frame even when nothing changes, for games and video. |
 | `no_vsync` | With OpenGL, do not wait for the display. Frames are still capped at 120 Hz or the refresh rate. |
 | `hidden` | Create the window without showing it, for tests. |
-| `renderer` | `CUI_RENDERER_AUTO` (default), `CUI_RENDERER_OPENGL`, `CUI_RENDERER_SOFTWARE` or `CUI_RENDERER_GPU` (Direct3D 12, Vulkan or Metal, in builds that have it; OpenGL if it cannot start). |
+| `renderer` | `CUI_RENDERER_AUTO` (default: Direct3D 12, Vulkan or Metal in builds that have it, else OpenGL, else software), `CUI_RENDERER_OPENGL`, `CUI_RENDERER_SOFTWARE` or `CUI_RENDERER_GPU` (OpenGL if it cannot start). `CUI_RENDERER=opengl`, `software` or `gpu` overrides it. |
+| `full_redraw` | Draw and present the whole window every frame. Without it only what changed is drawn and presented, and nothing when nothing did. |
 | `theme`, `accent` | The theme and accent to start with. |
 | `follow_system_theme` | Use the system's light or dark setting where the platform reports it. `cui_app_follow_system_theme` turns it on or off while the app runs. |
 | `app_id` | Linux: the name of the app's `.desktop` file without ".desktop", such as "org.example.Notes", so the desktop shows the app's name and icon for the window. See [Your app's name and icon on Linux](getting-started.md#your-apps-name-and-icon-on-linux). |

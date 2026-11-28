@@ -28,6 +28,11 @@ typedef unsigned int GLbitfield_;
 #define GL_RGBA_INTEGER_ 0x8D99
 #define GL_NEAREST_ 0x2600
 #define GL_TEXTURE1_ 0x84C1
+#define GL_FRAMEBUFFER_ 0x8D40
+#define GL_READ_FRAMEBUFFER_ 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_ 0x8CA9
+#define GL_DRAW_FRAMEBUFFER_BINDING_ 0x8CA6
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
 #define GL_UNSIGNED_INT_ 0x1405
 #define GL_UNSIGNED_BYTE_ 0x1401
 #define GL_FLOAT_ 0x1406
@@ -110,6 +115,12 @@ typedef struct {
     void (CUI_GLAPI *ReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void *);
     void (CUI_GLAPI *Finish)(void);
     void (CUI_GLAPI *DrawArraysInstanced)(GLenum_, GLint_, GLsizei_, GLsizei_);
+    void (CUI_GLAPI *GetIntegerv)(GLenum_, GLint_ *);
+    void (CUI_GLAPI *GenFramebuffers)(GLsizei_, GLuint_ *);
+    void (CUI_GLAPI *DeleteFramebuffers)(GLsizei_, const GLuint_ *);
+    void (CUI_GLAPI *BindFramebuffer)(GLenum_, GLuint_);
+    void (CUI_GLAPI *FramebufferTexture2D)(GLenum_, GLenum_, GLenum_, GLuint_, GLint_);
+    void (CUI_GLAPI *BlitFramebuffer)(GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLint_, GLbitfield_, GLenum_);
 } cui__gl_fns;
 
 struct cui_gl_renderer {
@@ -120,6 +131,11 @@ struct cui_gl_renderer {
     GLuint_ inst_program, inst_vao, inst_tex;
     GLint_ inst_u_viewport, inst_u_tex, inst_u_records, inst_u_first;
     int inst_rows;
+    /* cui_gl_render_damaged: the window as drawn so far, which only the damaged part of is drawn into */
+    struct { GLuint_ fbo, tex; int w, h; bool stale; } kept;   /* stale: frames drawn straight into the window are not in it */
+    bool direct;   /* this frame goes straight into the window (cui_damage_direct) */
+    int list_count;                   /* cui_gl_render_lists: the lists the kept image was last made of */
+    uint32_t list_ids[1 + CUI_SURFACES];
     bool es;
     bool software;   /* the driver draws on the CPU (llvmpipe, SwiftShader, ...) */
     struct { GLuint_ id; cui_texture_format fmt; int w, h; } *tex;
@@ -192,9 +208,20 @@ static const char *cui__inst_vs_src =
     "  float pad = mode == 2 ? param * 3.0 : ((mode == 1 || mode == 3) ? 1.0 : 0.0);\n"
     "  vec2 pos = mix(lo - pad, hi + pad, corner);\n"
     "  v_local = pos - center;\n"
+    "  int lean = int(q.z >> 24);\n"
+    "  pos.x += float(lean > 127 ? lean - 256 : lean) / 128.0 * (hi.y - pos.y);\n"
+    "  if (mode == 6) {\n"                                 /* a stroke from lo to hi: a box along it, shaded as a rounded rectangle */
+    "    vec2 along = hi - lo;\n"
+    "    float len = length(along);\n"
+    "    along = len > 0.0 ? along / len : vec2(1.0, 0.0);\n"
+    "    half_size = vec2(len * 0.5 + lo16(q.x) * 0.25, max(param * 0.5, 0.5));\n"
+    "    v_local = (corner * 2.0 - 1.0) * (half_size + 1.0);\n"
+    "    pos = center + along * v_local.x + vec2(-along.y, along.x) * v_local.y;\n"
+    "    mode = 1; param = 0.0;\n"
+    "  }\n"
     "  v_half = half_size;\n"
     "  v_uv = uv0 + (v_local + half_size) / (2.0 * half_size) * (uv1 - uv0);\n"
-    "  v_radii = vec4(lo16(q.x), hi16(q.x), lo16(q.y), hi16(q.y)) * 0.25;\n"
+    "  v_radii = int((q.z >> 16) & 255u) == 6 ? vec4(lo16(q.x) * 0.25) : vec4(lo16(q.x), hi16(q.x), lo16(q.y), hi16(q.y)) * 0.25;\n"
     "  v_params = vec2(param, float(mode));\n"
     "  v_color = mix(rgba(q.w), rgba(r.x), corner.y);\n"
     "  v_bcolor = rgba(r.y);\n"
@@ -295,6 +322,8 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
     CUI__LOAD(UseProgram); CUI__LOAD(GetUniformLocation); CUI__LOAD(Uniform1i); CUI__LOAD(Uniform2f);
     CUI__LOAD(BindAttribLocation); CUI__LOAD(ReadPixels); CUI__LOAD(Finish);
     CUI__LOAD(DrawArraysInstanced);
+    CUI__LOAD(GetIntegerv); CUI__LOAD(GenFramebuffers); CUI__LOAD(DeleteFramebuffers); CUI__LOAD(BindFramebuffer);
+    CUI__LOAD(FramebufferTexture2D); CUI__LOAD(BlitFramebuffer);
     if (missing) {
         fprintf(stderr, "cui: OpenGL function %s not available\n", missing);
         free(r);
@@ -398,6 +427,7 @@ void cui_gl_destroy(cui_gl_renderer *r) {
     r->gl.DeleteBuffers(1, &r->ebo);
     r->gl.DeleteVertexArrays(1, &r->vao);
     r->gl.DeleteProgram(r->program);
+    if (r->kept.fbo) { r->gl.DeleteFramebuffers(1, &r->kept.fbo); r->gl.DeleteTextures(1, &r->kept.tex); }
     if (r->inst_program) {
         r->gl.DeleteTextures(1, &r->inst_tex);
         r->gl.DeleteVertexArrays(1, &r->inst_vao);
@@ -469,10 +499,11 @@ cui_renderer_iface cui_gl_iface(cui_gl_renderer *r) {
     return i;
 }
 
-void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
+/* dd with its top left at ox, oy of a framebuffer TH pixels high. */
+static void cui__gl_draw(cui_gl_renderer *r, const cui_draw_data *dd, bool clear, int ox, int oy, int TH) {
     if (!r || !dd) return;
     int W = dd->width_px, H = dd->height_px;
-    r->gl.Viewport(0, 0, W, H);
+    r->gl.Viewport(ox, TH - oy - H, W, H);
     if (clear) {
         r->gl.ClearColor(dd->clear_color.r / 255.0f, dd->clear_color.g / 255.0f, dd->clear_color.b / 255.0f, 1.0f);
         r->gl.Clear(GL_COLOR_BUFFER_BIT_);
@@ -537,7 +568,7 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
         int x0 = (int)floorf(c->clip.x), y0 = (int)floorf(c->clip.y);
         int x1 = (int)ceilf(c->clip.x + c->clip.w), y1 = (int)ceilf(c->clip.y + c->clip.h);
         if (x1 <= x0 || y1 <= y0) continue;
-        r->gl.Scissor(x0, H - y1, x1 - x0, y1 - y0);
+        r->gl.Scissor(ox + x0, TH - oy - y1, x1 - x0, y1 - y0);
         cui_texture t = c->texture ? c->texture : dd->font_atlas;
         int slot = (int)t - 1;
         GLuint_ tid = (slot >= 0 && slot < r->tex_count) ? r->tex[slot].id : 0;
@@ -552,6 +583,174 @@ void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) {
     r->gl.Disable(GL_SCISSOR_TEST_);
     r->gl.BindVertexArray(0);
     r->gl.UseProgram(0);
+}
+
+void cui_gl_render(cui_gl_renderer *r, const cui_draw_data *dd, bool clear) { if (dd) cui__gl_draw(r, dd, clear, 0, 0, dd->height_px); }
+void cui_gl_render_at(cui_gl_renderer *r, const cui_draw_data *dd, int x, int y, int target_height) { cui__gl_draw(r, dd, false, x, y, target_height); }
+
+/* The kept image as it was drawn in part, against the same frame drawn whole into it. */
+/* The window clears to its color, opaque; a surface has none and clears to nothing. */
+static void cui__gl_clear(cui_gl_renderer *r, const cui_draw_data *dd) {
+    cui_color c = dd->clear_color;
+    float a = c.r || c.g || c.b || c.a ? 1.0f : 0.0f;
+    r->gl.ClearColor(c.r / 255.0f * a, c.g / 255.0f * a, c.b / 255.0f * a, a);
+    r->gl.Clear(GL_COLOR_BUFFER_BIT_);
+}
+
+/* Brings the kept image up to date with the frame. 0: the frame is as it was. 1: the image was
+ * redrawn where the frame changed. 2: all of it was, or the frame is to be drawn straight into the window. */
+static int cui__gl_kept_update(cui_gl_renderer *r, const cui_draw_data *dd, cui_damage *d) {
+    int W = dd->width_px, H = dd->height_px;
+    if (r->kept.w != W || r->kept.h != H) {
+        if (r->kept.fbo) { r->gl.DeleteFramebuffers(1, &r->kept.fbo); r->gl.DeleteTextures(1, &r->kept.tex); }
+        r->gl.GenTextures(1, &r->kept.tex);
+        r->gl.BindTexture(GL_TEXTURE_2D_, r->kept.tex);
+        r->gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, W, H, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, NULL);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+        r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+        r->gl.GenFramebuffers(1, &r->kept.fbo);
+        r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept.fbo);
+        r->gl.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, r->kept.tex, 0);
+        r->kept.w = W; r->kept.h = H;
+        cui_damage_reset(d);   /* the new image holds nothing yet */
+    }
+    cui_rect rect;
+    bool full = false;
+    bool changed = cui_damage_track(d, dd, &rect, &full);
+    r->direct = cui_damage_direct(d);
+    if (r->direct) {
+        if (changed) r->kept.stale = true;
+        return changed ? 2 : 0;
+    }
+    bool stale = r->kept.stale;   /* back to the kept image: all of it first */
+    if (!changed && !stale) return 0;
+    if (stale) { full = true; r->kept.stale = false; }
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept.fbo);
+    r->gl.Viewport(0, 0, W, H);
+    if (full) {
+        cui__gl_clear(r, dd);
+        cui_gl_render(r, dd, false);
+    } else {
+        cui_rect part[CUI_DAMAGE_BOXES];
+        int parts = 0;
+        const cui_draw_data *cut = cui_damage_clip_boxes(d, dd, part, &parts);
+        if (!cut) { cui__gl_clear(r, dd); cui_gl_render(r, dd, false); return 2; }
+        r->gl.Enable(GL_SCISSOR_TEST_);
+        for (int i = 0; i < parts; i++) {
+            r->gl.Scissor((GLint_)part[i].x, H - (GLint_)(part[i].y + part[i].h), (GLsizei_)part[i].w, (GLsizei_)part[i].h);
+            cui__gl_clear(r, dd);
+        }
+        r->gl.Disable(GL_SCISSOR_TEST_);
+        cui_gl_render(r, cut, false);
+    }
+    return full ? 2 : 1;
+}
+
+/* The kept image, whole, into the window's framebuffer. */
+static void cui__gl_kept_show(cui_gl_renderer *r, GLuint_ target, int W, int H) {
+    r->gl.BindFramebuffer(GL_READ_FRAMEBUFFER_, r->kept.fbo);
+    r->gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, target);
+    r->gl.Viewport(0, 0, W, H);
+    r->gl.Disable(GL_SCISSOR_TEST_);
+    r->gl.BlitFramebuffer(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT_, GL_NEAREST_);
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, target);
+}
+
+bool cui_gl_render_damaged(cui_gl_renderer *r, const cui_draw_data *dd, cui_damage *d, bool present_anyway) {
+    if (!r || !dd || !d) return false;
+    int W = dd->width_px, H = dd->height_px;
+    if (W <= 0 || H <= 0) return false;
+    GLint_ target = 0;   /* the window's framebuffer: not always 0 */
+    r->gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_, &target);
+    if (r->list_count != 1 || r->list_ids[0] != 0) { cui_damage_reset(d); r->list_count = 1; r->list_ids[0] = 0; }   /* the kept image was made of other lists */
+    int did = cui__gl_kept_update(r, dd, d);
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target);
+    if (!did && !present_anyway) return false;
+    if (r->direct) {   /* much of the window keeps changing: straight into it, with no copy */
+        r->gl.Viewport(0, 0, W, H);
+        r->gl.Disable(GL_SCISSOR_TEST_);
+        cui__gl_clear(r, dd);
+        cui_gl_render(r, dd, false);
+        return true;
+    }
+    cui__gl_kept_show(r, (GLuint_)target, W, H);
+    return true;
+}
+
+bool cui_gl_render_lists(cui_gl_renderer *r, const cui_render_list *lists, int count, bool present_anyway) {
+    if (!r || !lists || count < 1 || !lists[0].draw || !lists[0].damage) return false;
+    if (count > 1 + CUI_SURFACES) count = 1 + CUI_SURFACES;
+    bool same = count == r->list_count;
+    for (int i = 0; same && i < count; i++) same = r->list_ids[i] == lists[i].id;
+    if (count == 1 && same) return cui_gl_render_damaged(r, lists[0].draw, lists[0].damage, present_anyway);
+    const cui_draw_data *dd = lists[0].draw;
+    int W = dd->width_px, H = dd->height_px;
+    if (W <= 0 || H <= 0) return false;
+    GLint_ target = 0;
+    r->gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_, &target);
+    if (r->kept.w != W || r->kept.h != H || !same) {
+        /* another size, or other lists than the frame before: nothing of the kept image holds */
+        if (r->kept.w != W || r->kept.h != H) {
+            if (r->kept.fbo) { r->gl.DeleteFramebuffers(1, &r->kept.fbo); r->gl.DeleteTextures(1, &r->kept.tex); }
+            r->gl.GenTextures(1, &r->kept.tex);
+            r->gl.BindTexture(GL_TEXTURE_2D_, r->kept.tex);
+            r->gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, W, H, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, NULL);
+            r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+            r->gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+            r->gl.GenFramebuffers(1, &r->kept.fbo);
+            r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept.fbo);
+            r->gl.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, r->kept.tex, 0);
+            r->kept.w = W; r->kept.h = H;
+        }
+        for (int i = 0; i < count; i++) cui_damage_reset(lists[i].damage);
+        r->list_count = count;
+        for (int i = 0; i < count; i++) r->list_ids[i] = lists[i].id;
+    }
+    cui_rect boxes[3 * (1 + CUI_SURFACES)];   /* a list's change, where it lay and where it lies */
+    int n = cui_damage_track_lists(lists, count, boxes, (int)(sizeof boxes / sizeof *boxes));
+    r->direct = cui_damage_direct(lists[0].damage);
+    if (!n && !present_anyway) { r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target); return false; }
+    if (r->direct) {   /* much of the window keeps changing: every list straight into it, with no copy */
+        r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target);
+        r->gl.Viewport(0, 0, W, H);
+        r->gl.Disable(GL_SCISSOR_TEST_);
+        cui__gl_clear(r, dd);
+        for (int i = 0; i < count; i++) cui__gl_draw(r, lists[i].draw, false, lists[i].x, lists[i].y, H);
+        r->kept.stale = true;
+        return true;
+    }
+    if (r->kept.stale) { n = -1; r->kept.stale = false; }   /* back to the kept image: all of it first */
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, r->kept.fbo);
+    r->gl.Viewport(0, 0, W, H);
+    if (n < 0) {
+        r->gl.Disable(GL_SCISSOR_TEST_);
+        cui__gl_clear(r, dd);
+        for (int i = 0; i < count; i++) cui__gl_draw(r, lists[i].draw, false, lists[i].x, lists[i].y, H);
+    }
+    for (int b = 0; b < n; b++) {
+        r->gl.Viewport(0, 0, W, H);
+        r->gl.Enable(GL_SCISSOR_TEST_);
+        r->gl.Scissor((GLint_)boxes[b].x, H - (GLint_)(boxes[b].y + boxes[b].h), (GLsizei_)boxes[b].w, (GLsizei_)boxes[b].h);
+        cui__gl_clear(r, dd);
+        r->gl.Disable(GL_SCISSOR_TEST_);
+        for (int i = 0; i < count; i++) {   /* every list that reaches into the box, in order: they are blended into one image */
+            cui_rect in = { boxes[b].x - (float)lists[i].x, boxes[b].y - (float)lists[i].y, boxes[b].w, boxes[b].h };
+            if (in.x >= (float)lists[i].draw->width_px || in.y >= (float)lists[i].draw->height_px || in.x + in.w <= 0 || in.y + in.h <= 0) continue;
+            cui__gl_draw(r, cui_damage_clip(lists[i].damage, lists[i].draw, in), false, lists[i].x, lists[i].y, H);
+        }
+    }
+    r->gl.BindFramebuffer(GL_FRAMEBUFFER_, (GLuint_)target);
+    cui__gl_kept_show(r, (GLuint_)target, W, H);
+    return true;
+}
+
+
+void cui_gl_render_surface(cui_gl_renderer *r, const cui_draw_data *dd) {
+    if (!r || !dd) return;
+    r->gl.Viewport(0, 0, dd->width_px, dd->height_px);
+    r->gl.Disable(GL_SCISSOR_TEST_);
+    cui__gl_clear(r, dd);
+    cui_gl_render(r, dd, false);
 }
 
 void cui_gl_read_pixels(cui_gl_renderer *r, int w, int h, void *rgba) {

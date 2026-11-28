@@ -225,6 +225,11 @@ void cui_font_set_role(cui_ctx *ui, cui_font role, cui_font font) {
     ui->fonts[real].is_icon = role == CUI_FONT_ICONS;
 }
 
+void cui_font_set_icon(cui_ctx *ui, cui_font font, bool icon) {
+    if (font < CUI__USER_FONT_BASE || font - CUI__USER_FONT_BASE >= ui->font_count) return;
+    ui->fonts[font - CUI__USER_FONT_BASE].is_icon = icon;
+}
+
 void cui_font_add_fallback(cui_ctx *ui, cui_font font, cui_font fallback) {
     cui_font_data *fd = cui__fd(ui, cui__resolve_font(ui, font));
     int fb = cui__resolve_font(ui, fallback);

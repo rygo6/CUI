@@ -273,10 +273,7 @@ void cui_destroy(cui_ctx *ui) {
     cui__free(ui, ui->focus_order);
     cui__free(ui, ui->prev_focus_order);
     cui__free(ui, ui->focus_scope_stack);
-    cui__free(ui, ui->dl.vtx);
-    cui__free(ui, ui->dl.idx);
-    cui__free(ui, ui->dl.cmd);
-    cui__free(ui, ui->dl.inst);
+    cui__draw_free(ui);
     ui->arena_used = 0;
     cui__frame_arena_reset(ui);
     cui__free(ui, ui->arena);
@@ -1165,17 +1162,7 @@ void cui_end_frame(cui_ctx *ui) {
     cui__state_gc(ui);
     cui__fonts_upload(ui);
 
-    cui_draw_data *dd = &ui->draw_data;
-    dd->vertices = ui->dl.vtx;
-    dd->vertex_count = ui->dl.vtx_count;
-    dd->indices = ui->dl.idx;
-    dd->index_count = ui->dl.idx_count;
-    dd->commands = ui->dl.cmd;
-    dd->command_count = ui->dl.cmd_count;
-    dd->width_px = (int)(ui->vw * ui->scale + 0.5f);
-    dd->height_px = (int)(ui->vh * ui->scale + 0.5f);
-    dd->clear_color = ui->theme.colors[CUI_TOKEN_BACKGROUND];
-    dd->font_atlas = ui->atlas_tex;
+    cui__draw_finish(ui);
     cui_id owner = ui->component_input.focus_owner;
     cui_id request = ui->component_input.focus_request;
     if (owner || request) {
@@ -1195,12 +1182,9 @@ void cui_end_frame(cui_ctx *ui) {
         ui->component_input.focus_owner = ui->focus == owner ? owner : 0;
         ui->component_input.focus_request = 0;
     }
-    dd->instances = ui->dl.inst;
-    dd->instance_count = ui->dl.inst_count;
     ui->in_frame = false;
 }
 
-const cui_draw_data *cui_get_draw_data(cui_ctx *ui) { return &ui->draw_data; }
 
 void cui__wakeup_after(cui_ctx *ui, float seconds) { cui__wake_in(ui, seconds); }
 void cui_request_wakeup(cui_ctx *ui, float seconds) { if (ui) cui__wake_in(ui, seconds); }
