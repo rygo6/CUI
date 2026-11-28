@@ -191,6 +191,9 @@ typedef struct cui__wl {
     bool shown;                     /* cui__plat_show was called: pictures may go to the window */
     bool unpaced;                   /* cui_app_desc.no_vsync: frames do not wait for the compositor's frame callbacks */
     bool gpu_started, gpu_skipped;  /* Vulkan: a frame was drawn; one was held back while the window was hidden (cui__plat_gpu_frame) */
+    bool gpu_seen;                  /* Vulkan: a frame callback came, so a picture is on the surface */
+    bool sw_retry;                  /* software: no buffer could be made and none is out to come back */
+    cui_key held_key[256];          /* the key each key code went down as, so a layout switch releases it */
 } cui__wl;
 
 #define CUI__WL_CLIP_SECONDS 5.0             /* the longest a paste waits for its text */
@@ -732,6 +735,8 @@ static cui_key cui__wl_key_of(cui__wl *w, uint32_t code) {
 static void cui__wl_key_event(cui__wl *w, uint32_t code, bool down) {
     if (!w->xkb_state) return;
     cui_key key = cui__wl_key_of(w, code);
+    if (code < 256 && down) w->held_key[code] = key;
+    else if (code < 256 && w->held_key[code]) { key = w->held_key[code]; w->held_key[code] = CUI_KEY_NONE; }
     if (key) cui_input_key(w->app->ui, key, down, w->mods);
     if (down && !(w->mods & CUI_MOD_CTRL)) {
         char text[64];
@@ -923,6 +928,7 @@ static const char *cui__wl_get_clip(void *user) {
     size_t len = 0, cap = 0;
     char *text = NULL;
     double start = cui__plat_now(), last = start;
+    bool eof = false;   /* text only once the owner closed the pipe: a stalled or cut transfer is no paste */
     for (;;) {
         struct pollfd pfd = { fds[0], POLLIN, 0 };
         double now = cui__plat_now();
@@ -936,11 +942,12 @@ static const char *cui__wl_get_clip(void *user) {
         }
         ssize_t n = read(fds[0], text + len, 4096);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n <= 0) { eof = n == 0; break; }
         len += (size_t)n;
         last = cui__plat_now();
     }
     close(fds[0]);
+    if (!eof) { free(text); text = NULL; }
     free(w->clip_read);
     w->clip_read = text;
     if (text) text[len] = 0;
@@ -955,14 +962,16 @@ static void cui__wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t
         w->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(w->pointer, &cui__wl_pointer_listener, w);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && w->pointer) {
-        wl_pointer_destroy(w->pointer);
+        if (w->seat_version >= WL_POINTER_RELEASE_SINCE_VERSION) wl_pointer_release(w->pointer);
+        else wl_pointer_destroy(w->pointer);
         w->pointer = NULL;
     }
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !w->keyboard) {
         w->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(w->keyboard, &cui__wl_keyboard_listener, w);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && w->keyboard) {
-        wl_keyboard_destroy(w->keyboard);
+        if (w->seat_version >= WL_KEYBOARD_RELEASE_SINCE_VERSION) wl_keyboard_release(w->keyboard);
+        else wl_keyboard_destroy(w->keyboard);
         w->keyboard = NULL;
         w->repeat_key = 0;
     }
@@ -1103,12 +1112,11 @@ static void cui__wl_xdg_surface_configure(void *data, struct xdg_surface *xs, ui
     if (w->pending_activated) w->minimized = false;
     int bar = cui__wl_bar_height(w);
     bool normal = !w->maximized && !w->fullscreen && !w->tiled;
-    if (w->pending_w > 0 && w->pending_h > 0) {
-        w->width = w->pending_w;
-        w->height = w->pending_h - bar > 1 ? w->pending_h - bar : 1;
-    } else if (normal) {   /* the size is ours to choose: back to the one before it was maximized */
-        w->width = w->normal_w; w->height = w->normal_h;
-    }
+    /* each axis the compositor leaves at 0 is ours to choose: the size before it was maximized */
+    if (w->pending_w > 0) w->width = w->pending_w;
+    else if (normal) w->width = w->normal_w;
+    if (w->pending_h > 0) w->height = w->pending_h - bar > 1 ? w->pending_h - bar : 1;
+    else if (normal) w->height = w->normal_h;
     if (normal) { w->normal_w = w->width; w->normal_h = w->height; }
     xdg_surface_ack_configure(xs, serial);
     cui__wl_apply(w);
@@ -1208,10 +1216,12 @@ static bool cui__wl_pump(cui__wl *w, double timeout, bool for_frame) {
 
 void cui__plat_wait(cui_app *app, double timeout) {
     cui__wl *w = cui__wl_of(app);
+    if (w->sw_retry && (timeout < 0 || timeout > 0.1)) timeout = 0.1;
     if (!cui__wl_pump(w, timeout, false)) {
         if (app->running) fprintf(stderr, "cui: the Wayland compositor closed the connection\n");
         app->running = false;
     }
+    if (w->sw_retry) { w->sw_retry = false; app->force_present = true; }
 }
 
 /* ---- window ---- */
@@ -1272,8 +1282,8 @@ bool cui__plat_init(cui_app *app) {
     wl_registry_add_listener(w->registry, &cui__wl_registry_listener, w);
     wl_display_roundtrip(w->dpy);   /* the globals */
     wl_display_roundtrip(w->dpy);   /* what they say of themselves: outputs, the seat */
-    if (!w->compositor || !w->wm) {
-        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor has no %s", w->compositor ? "xdg_wm_base" : "wl_compositor"); fprintf(stderr, "cui: wayland: %s\n", cui__wl_error);
+    if (!w->compositor || w->compositor_version < 3 || !w->wm) {   /* (3: wl_surface.set_buffer_scale) */
+        snprintf(cui__wl_error, sizeof cui__wl_error, "the compositor has no %s", w->compositor_version >= 3 ? "xdg_wm_base" : "wl_compositor 3"); fprintf(stderr, "cui: wayland: %s\n", cui__wl_error);
         cui__wl_destroy(w);
         return false;
     }
@@ -1442,7 +1452,7 @@ void cui__plat_gl_release(cui_app *app) {
 static void cui__wl_frame_done(void *data, struct wl_callback *callback, uint32_t time) {
     cui__wl *w = data;
     (void)time;
-    if (w->frame == callback) w->frame = NULL;
+    if (w->frame == callback) { w->frame = NULL; w->gpu_seen = true; }
     if (w->gpu_skipped) {   /* the window is seen again: the frame that was not drawn */
         w->gpu_skipped = false;
         cui_request_redraw(w->app->ui);
@@ -1456,11 +1466,11 @@ static const struct wl_callback_listener cui__wl_frame_listener = { cui__wl_fram
  * the display (FIFO) waits without end while the window is hidden, and the app stops answering
  * with it. So each frame asks for a frame callback of its own, and the next is drawn once it
  * came; a hidden window gets none, and is drawn again when it does (cui__wl_frame_done). */
-bool cui__plat_gpu_frame(cui_app *app) {
+bool cui__plat_gpu_frame(cui_app *app, int width, int height) {
     cui__wl *w = cui__wl_of(app);
     if (!w->shown) return false;
     double start = cui__plat_now();
-    bool unpaced = app->desc.no_vsync;   /* drawn as fast as cui_app asks: the swapchain's present mode decides what is shown */
+    bool unpaced = app->desc.no_vsync || !w->gpu_seen;   /* until a callback came, none may come */
     while (w->frame && app->running && !unpaced) {
         double left = 0.25 - (cui__plat_now() - start);
         if (left <= 0) break;
@@ -1468,6 +1478,10 @@ bool cui__plat_gpu_frame(cui_app *app) {
     }
     if (w->frame && unpaced) { wl_callback_destroy(w->frame); w->frame = NULL; }
     if (w->frame) { w->gpu_skipped = true; return false; }
+    if (width != w->fb_w || height != w->fb_h) {   /* a configure came while waiting: draw at the new size */
+        cui_request_redraw(app->ui);
+        return false;
+    }
     if (w->gpu_started) {   /* (the first frame maps the window: nothing to wait for before it) */
         w->frame = wl_surface_frame(w->surface);
         wl_callback_add_listener(w->frame, &cui__wl_frame_listener, w);
@@ -1516,7 +1530,11 @@ static void cui__wl_present_rect(cui_app *app, const void *bgra, int width, int 
         wl_buffer_add_listener(b->buffer, &cui__wl_sw_buffer_listener, w);
     }
     if (!w->shown) return;   /* a hidden app: no picture, so no window */
-    if (!b) { w->sw_dropped = true; return; }   /* the compositor holds all three: the whole picture goes out when one comes back */
+    if (!b) {   /* all three are out and come back, or none could be made and a retry is due */
+        bool out = w->sw_buffers[0].busy || w->sw_buffers[1].busy || w->sw_buffers[2].busy;
+        if (out) w->sw_dropped = true; else w->sw_retry = true;
+        return;
+    }   /* the compositor holds all three: the whole picture goes out when one comes back */
     for (int row = 0; row < height; row++) memcpy(b->pixels + (size_t)row * width, (const uint8_t *)bgra + (size_t)row * stride, (size_t)width * 4);
     wl_surface_attach(w->surface, b->buffer, 0, 0);
     if (w->compositor_version >= 4) wl_surface_damage_buffer(w->surface, x, y, pw, ph);

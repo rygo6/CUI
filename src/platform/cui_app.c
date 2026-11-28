@@ -30,8 +30,8 @@ static bool cui__env_is(const char *name, const char *value) {
  * other Linux backends (GLFW, SDL) do not have one. */
 extern cui_x11_window *cui__plat_x11_window(cui_app *app) __attribute__((weak));
 /* The Wayland backend's: false when a frame must not be drawn now (the window is hidden, and a
- * presentation would wait for it without end). */
-extern bool cui__plat_gpu_frame(cui_app *app) __attribute__((weak));
+ * presentation would wait for it without end, or the window took another size than w by h). */
+extern bool cui__plat_gpu_frame(cui_app *app, int width, int height) __attribute__((weak));
 #endif
 
 static void cui__app_make_software(cui_app *app) {
@@ -244,7 +244,7 @@ void cui__app_render(cui_app *app) {
     if (app->gpu) {
 #if defined(__linux__)
         cui__plat_x11_window(app);   /* the renderer reads the window's size from it */
-        if (!cui__plat_gpu_frame || cui__plat_gpu_frame(app))
+        if (!cui__plat_gpu_frame || cui__plat_gpu_frame(app, w, h))
 #endif
         cui_gpu_render(app->gpu, dd);
         app->force_present = false;

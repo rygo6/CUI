@@ -299,7 +299,7 @@ Android and iOS are supported as experimental platform backends: `-DCUI_PLATFORM
 | `undefined reference to XOpenDisplay` (building without CMake) | Put `-lX11 -ldl -lm -lpthread` after the source files on the command line |
 | No window on Wayland without XWayland | Configure with `-DCUI_PLATFORM=wayland` for a native Wayland window ([what it needs](platform.md#wayland-windows)), or with `-DCUI_PLATFORM=sdl2` or `-DCUI_PLATFORM=glfw` (install `libsdl2-dev` or `libglfw3-dev`) |
 | Black or empty window, OpenGL errors (virtual machines, remote desktop, old drivers) | CUI falls back to its software renderer when OpenGL 3.3 cannot start; to force it, run with `CUI_RENDERER=software` |
-| Everything looks too small or too large | Run with `CUI_SCALE=1.5` (or any scale) to override what the display reports |
+| Everything looks too small or too large | Run with `CUI_SCALE=1.5` (or any scale) to override what the display reports; a native Wayland window takes the compositor's display scale instead |
 | A console window opens next to the app (Windows) | Call `cui_app_target(my_app)` in your `CMakeLists.txt`. Without CMake: `-mwindows` (MinGW), or `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup` (MSVC) |
 | `cui/cui.h: No such file or directory` with the single-file distribution | Write `#include "cui.h"` in place of `<cui/cui.h>` and `<cui/cui_app.h>` (see [One file](#one-file)) |
 | The app is over 1 MB | The linker kept every component. Call `cui_app_target(my_app)` and build `Release` or `MinSizeRel`; without CMake see the flags under [One file](#one-file) |

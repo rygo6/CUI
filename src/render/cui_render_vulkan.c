@@ -19,7 +19,8 @@
 
 #ifdef CUI_WAYLAND   /* the app's window is a Wayland one (CUI_PLATFORM=wayland), otherwise an X11 one */
 #define VK_USE_PLATFORM_WAYLAND_KHR
-#include <wayland-client.h>
+struct wl_display;
+struct wl_surface;
 #else
 #define VK_USE_PLATFORM_XLIB_KHR
 #include <X11/Xlib.h>
