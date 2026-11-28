@@ -702,6 +702,8 @@ static void cui__wl_keyboard_leave(void *data, struct wl_keyboard *k, uint32_t s
     w->events++;
     (void)k; (void)serial; (void)surface;
     w->repeat_key = 0;
+    w->mods = 0;
+    memset(w->held_key, 0, sizeof w->held_key);
     cui_input_focus(w->app->ui, false);
 }
 
@@ -735,8 +737,10 @@ static cui_key cui__wl_key_of(cui__wl *w, uint32_t code) {
 static void cui__wl_key_event(cui__wl *w, uint32_t code, bool down) {
     if (!w->xkb_state) return;
     cui_key key = cui__wl_key_of(w, code);
-    if (code < 256 && down) w->held_key[code] = key;
-    else if (code < 256 && w->held_key[code]) { key = w->held_key[code]; w->held_key[code] = CUI_KEY_NONE; }
+    if (code < 256 && w->held_key[code]) {   /* a repeat or the release: the key it went down as */
+        key = w->held_key[code];
+        if (!down) w->held_key[code] = CUI_KEY_NONE;
+    } else if (code < 256 && down) w->held_key[code] = key;
     if (key) cui_input_key(w->app->ui, key, down, w->mods);
     if (down && !(w->mods & CUI_MOD_CTRL)) {
         char text[64];
@@ -962,6 +966,7 @@ static void cui__wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t
         w->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(w->pointer, &cui__wl_pointer_listener, w);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && w->pointer) {
+        cui__wl_pointer_leave(w, w->pointer, 0, NULL);   /* no release comes from a gone pointer */
         if (w->seat_version >= WL_POINTER_RELEASE_SINCE_VERSION) wl_pointer_release(w->pointer);
         else wl_pointer_destroy(w->pointer);
         w->pointer = NULL;
@@ -970,10 +975,10 @@ static void cui__wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t
         w->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(w->keyboard, &cui__wl_keyboard_listener, w);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && w->keyboard) {
+        cui__wl_keyboard_leave(w, w->keyboard, 0, NULL);
         if (w->seat_version >= WL_KEYBOARD_RELEASE_SINCE_VERSION) wl_keyboard_release(w->keyboard);
         else wl_keyboard_destroy(w->keyboard);
         w->keyboard = NULL;
-        w->repeat_key = 0;
     }
 }
 static void cui__wl_seat_name(void *data, struct wl_seat *seat, const char *name) { (void)data; (void)seat; (void)name; }
@@ -1531,8 +1536,8 @@ static void cui__wl_present_rect(cui_app *app, const void *bgra, int width, int 
     }
     if (!w->shown) return;   /* a hidden app: no picture, so no window */
     if (!b) {   /* all three are out and come back, or none could be made and a retry is due */
-        bool out = w->sw_buffers[0].busy || w->sw_buffers[1].busy || w->sw_buffers[2].busy;
-        if (out) w->sw_dropped = true; else w->sw_retry = true;
+        bool all_out = w->sw_buffers[0].busy && w->sw_buffers[1].busy && w->sw_buffers[2].busy;
+        if (all_out) w->sw_dropped = true; else w->sw_retry = true;   /* one shown is not released */
         return;
     }   /* the compositor holds all three: the whole picture goes out when one comes back */
     for (int row = 0; row < height; row++) memcpy(b->pixels + (size_t)row * width, (const uint8_t *)bgra + (size_t)row * stride, (size_t)width * 4);
